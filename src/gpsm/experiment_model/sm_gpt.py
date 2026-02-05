@@ -100,7 +100,7 @@ class StateMachineGPT(nn.Module):
         self.blocks = nn.Sequential(*[Block(self.config) for _ in range(self.config['n_layers'])])
 
         self.ln_f = nn.LayerNorm(self.config['n_embd'])
-        self.next_pos_head = nn.Linear(self.config['n_embd'], config['input_dim'])
+        self.next_pos_head = nn.Linear(self.config['n_embd'], config['state_dim'])
         
 
         self.optimizer = optim.AdamW(self.parameters(), lr=self.config['learning_rate'])
@@ -116,22 +116,61 @@ class StateMachineGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, obs, action, step, targets=None):
-        #B,T = obs.shape
+    def forward(self, obs, targets=None):
+        """
+        Supports:
+        - obs: (B, T, D)  batched sequences (recommended)
+        - obs: (T, D)     single sequence (will be auto-batched to B=1)
 
+        Returns:
+        - logits: (B, T, ...)   if batched input
+        - logits: (T, ...)      if single-seq input
+        """
+        if not torch.is_tensor(obs):
+            raise TypeError(f"`obs` must be a torch.Tensor, got {type(obs)}")
+
+        if obs.dim() == 2:
+            # (T, D) -> (1, T, D)
+            obs = obs.unsqueeze(0)
+            squeeze_B = True
+        elif obs.dim() == 3:
+            # (B, T, D)
+            squeeze_B = False
+        else:
+            raise ValueError(
+                f"`obs` must be 2D (T,D) or 3D (B,T,D). Got shape={tuple(obs.shape)}"
+            )
+
+        B, T, D = obs.shape
+
+        # ---- sanity checks (optional but helpful)
+        if T <= 0:
+            raise ValueError(f"Sequence length T must be > 0, got T={T}")
+        if hasattr(self, "obs_dim"):
+            # if you store expected obs_dim in the model
+            if D != self.obs_dim:
+                raise ValueError(f"Expected obs feature dim D={self.obs_dim}, got D={D}")
+
+        # ---- embed observations
+        # Should accept (B,T,D) and output (B,T,n_embd)
         obs_emb = self.prev_pos_embedding(obs)
 
-        step = step.to(obs.device).long()                   # (B,T) long on same device
-        step = step % self.config['max_timestep']           # safety (even if you already cycle)
-        pos = self.relative_pos_embedding(step)
-        x = obs_emb + pos
+
+        # ---- positional embedding created inside the model (no need from dataset)
+        step = torch.arange(T, device=obs.device, dtype=torch.long).unsqueeze(0).expand(B, -1)  # (B,T)
+        pos_emb = self.relative_pos_embedding(step)
+
+        x = obs_emb + pos_emb
         x = self.blocks(x)
         x = self.ln_f(x)
+        logits = self.next_pos_head(x)
 
-        next_pos_logits = self.next_pos_head(x)
+        # Return shape consistent with input style
+        if squeeze_B:
+            logits = logits.squeeze(0)
 
+        return logits
 
-        return next_pos_logits
     
 
     def print_param_size(self):
