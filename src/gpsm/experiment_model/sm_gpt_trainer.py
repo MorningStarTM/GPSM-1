@@ -153,7 +153,7 @@ class SMTrainer:
 
                 # forward
                 logits = self.model(x)               # (B,T,D) or (T,D)
-                loss = self._compute_loss(logits, y)
+                loss = self._compute_loss(logits, y) * self.model.config.get("loss_scale", 1.0)
 
                 # backward
                 self.optimizer.zero_grad(set_to_none=True)
