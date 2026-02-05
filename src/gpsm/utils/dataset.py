@@ -4,18 +4,39 @@ import torch
 from torch.utils.data import Dataset
 
 # -------------------- utils (same as yours) --------------------
-def forward_fill_nan(points_t_m_3: np.ndarray) -> np.ndarray:
+def forward_fill_nan(points_t_m_3: np.ndarray, fill_value: float = 0.0) -> np.ndarray:
+    """
+    ffill + bfill per (marker, coord). Any remaining all-NaN columns -> fill_value.
+    """
     out = points_t_m_3.copy()
     T, M, C = out.shape
+
     for m in range(M):
         for c in range(C):
-            col = out[:, m, c]
+            col = out[:, m, c]  # (T,)
             isn = np.isnan(col)
-            if isn.any():
-                idx = np.where(~isn, np.arange(T), 0)
-                np.maximum.accumulate(idx, out=idx)
-                out[:, m, c] = col[idx]
+            if not isn.any():
+                continue
+
+            valid = ~isn
+            if not valid.any():
+                # Entire column is NaN
+                out[:, m, c] = fill_value
+                continue
+
+            # forward fill
+            idx = np.where(valid, np.arange(T), 0)
+            np.maximum.accumulate(idx, out=idx)
+            col_ffill = col[idx]
+
+            # backward fill for leading NaNs (use first valid value)
+            first_valid_idx = np.argmax(valid)  # first True
+            col_ffill[:first_valid_idx] = col[first_valid_idx]
+
+            out[:, m, c] = col_ffill
+
     return out
+
 
 def drop_bad_markers(points_t_m_3: np.ndarray, labels, nan_thresh=0.20):
     nan_mask = np.isnan(points_t_m_3).any(axis=2)  # (T, M)
