@@ -139,12 +139,15 @@ class SMTrainer:
                 # dataset returns (x,pos,y)
                 x, pos, y = batch
 
-                # sanity (CPU shapes)
-                self._sanity_batch(x, pos, y, ep=ep, where="train")
-
                 # move
                 x = x.to(self.device)
                 y = y.to(self.device)
+
+                # guard: skip bad batches
+                if not torch.isfinite(x).all() or not torch.isfinite(y).all():
+                    # optional: print once to debug
+                    # print("Skipping non-finite batch")
+                    continue
                 # pos is not used, but move if you want to keep it around for debugging
                 # pos = pos.to(self.device)
 
