@@ -173,6 +173,61 @@ class StateMachineGPT(nn.Module):
 
     
 
+    @torch.no_grad()
+    def predict_next(self, x_one: torch.Tensor, return_last_only: bool = True):
+        """
+        Inference helper for a SINGLE sample.
+
+        Args:
+            x_one: torch.Tensor of shape
+                - (T, D)  (single sequence)  OR
+                - (1, T, D) (already batched single sequence)
+            return_last_only: if True returns only the last-step prediction (next frame)
+
+        Returns:
+            If return_last_only:
+                - (D,)    if input was (T,D)
+                - (1,D)   if input was (1,T,D)
+            Else:
+                - (T,D)   if input was (T,D)
+                - (1,T,D) if input was (1,T,D)
+        """
+        self.eval()
+
+        if not torch.is_tensor(x_one):
+            raise TypeError(f"x_one must be a torch.Tensor, got {type(x_one)}")
+
+        if x_one.dim() == 2:
+            T, D = x_one.shape
+            x_in = x_one.unsqueeze(0)   # (1,T,D)
+            squeeze_B = True
+        elif x_one.dim() == 3:
+            B, T, D = x_one.shape
+            if B != 1:
+                raise ValueError(f"predict_next expects a single sample (B=1). Got B={B}")
+            x_in = x_one
+            squeeze_B = False
+        else:
+            raise ValueError(f"x_one must be (T,D) or (1,T,D). Got {tuple(x_one.shape)}")
+
+        # timestep range check for pos embedding
+        max_t = self.config["max_timestep"]
+        if T > max_t:
+            raise ValueError(f"T={T} exceeds max_timestep={max_t}. Increase config['max_timestep'].")
+
+        x_in = x_in.to(self.device)
+
+        logits = self.forward(x_in)      # (1,T,D)
+
+        if return_last_only:
+            pred_next = logits[:, -1, :]  # (1,D)
+            return pred_next.squeeze(0) if squeeze_B else pred_next
+        else:
+            return logits.squeeze(0) if squeeze_B else logits
+
+
+
+
     def print_param_size(self):
         """
         Print total number of parameters in millions.
