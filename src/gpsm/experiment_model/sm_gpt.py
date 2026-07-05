@@ -255,6 +255,15 @@ class StateMachineGPT(nn.Module):
                 f"T={T} exceeds max_timestep={self.config['max_timestep']}. "
                 "Increase max_timestep in config."
             )
+        if D != self.config["state_dim"]:
+            raise ValueError(
+                f"Input feature dim D={D} does not match config['state_dim']="
+                f"{self.config['state_dim']}. This usually means the dataset's "
+                "actual feature width differs from what the model was configured "
+                "with (e.g. mixed SMPL/SMPL-X pose widths across files) — set "
+                "config['state_dim'] from the dataset's own D (e.g. ds.D) rather "
+                "than hardcoding it."
+            )
 
         obs_emb = self.prev_pos_embedding(obs)   # (B, T, n_embd)
 
