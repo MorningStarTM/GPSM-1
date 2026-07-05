@@ -1,246 +1,212 @@
-import os, math
+import os
+import math
 import torch
 import torch.nn.functional as F
-from src.gpsm.experiment_model.sm_gpt import StateMachineGPT 
+from src.gpsm.experiment_model.sm_gpt import StateMachineGPT
 from src.gpsm.utils.logger import logger
 
 
-# ---------------------------------------------------------
-# Trainer for StateMachineGPT 
-# ---------------------------------------------------------
 class SMTrainer:
-    def __init__(self, config, ckpt_dir="checkpoints"):
-        """
-        config must include:
-          - state_dim
-          - max_timestep (>= sequence length T you feed)
-          - learning_rate
-          - (n_embd, n_layers, etc. for model)
-        """
-        self.config = config
+    """
+    Trainer for StateMachineGPT.
+
+    FIX 3 — vestigial `pos` tensor:
+      The dataset returns (x, pos, y) but StateMachineGPT generates its own
+      positional indices internally with torch.arange(T). The `pos` tensor
+      from the batch was never passed to the model and never used. We now
+      unpack it explicitly as `_pos` (throwaway) so the intent is clear,
+      and we document why it is discarded. If you ever need external pos
+      (e.g. absolute frame indices for a global sequence), wire it in here.
+    """
+
+    def __init__(self, config: dict, ckpt_dir: str = "checkpoints"):
+        self.config   = config
         self.ckpt_dir = ckpt_dir
         os.makedirs(self.ckpt_dir, exist_ok=True)
-
 
         self.model = StateMachineGPT(config)
         self.device = self.model.device
         self.model.to(self.device)
         self.model.print_param_size()
 
-        # optimizer is already created inside the model
         self.optimizer = self.model.optimizer
+        self._eps      = 1e-8
 
-        # (optional) small constant for numerical safety checks
-        self._eps = 1e-8
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-    # -------- helpers (same style as your WMTrainer)
-    def _is_ddp(self):
-        try:
-            from torch.nn.parallel import DistributedDataParallel as DDP
-            return isinstance(self.model, DDP)
-        except Exception:
-            return False
+    def _is_ddp(self) -> bool:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        return isinstance(self.model, DDP)
 
-    def _rank(self):
+    def _rank(self) -> int:
         import torch.distributed as dist
         return dist.get_rank() if dist.is_initialized() else 0
 
-    def _is_main(self):
+    def _is_main(self) -> bool:
         return self._rank() == 0
 
     def _module(self):
-        # return underlying module if DDP else model itself
         return self.model.module if self._is_ddp() else self.model
 
-    # -------- core utilities
-    def _sanity_batch(self, x, pos, y, ep=None, where="train"):
+    def _compute_loss(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
-        x:  (B,T,D) or (T,D)
-        pos:(B,T) or (T,) (not used in model, but we validate shape anyway)
-        y:  (B,D) or (D,)
+        MSE loss between the last-token prediction and the target next frame.
+
+        logits : (B, T, D) or (T, D)
+        y      : (B, D)    or (D,)
         """
-        if not torch.is_tensor(x) or not torch.is_tensor(y):
-            raise TypeError(f"[{where}] x and y must be tensors. got x={type(x)} y={type(y)}")
-
-        if x.dim() == 2:
-            T, D = x.shape
-            if y.dim() != 1 or y.shape[0] != D:
-                raise ValueError(f"[{where}] for x(T,D) expected y(D). got x={tuple(x.shape)} y={tuple(y.shape)}")
-            if pos is not None:
-                if pos.dim() != 1 or pos.shape[0] != T:
-                    raise ValueError(f"[{where}] for x(T,D) expected pos(T). got pos={tuple(pos.shape)} T={T}")
-        elif x.dim() == 3:
-            B, T, D = x.shape
-            if y.dim() != 2 or y.shape != (B, D):
-                raise ValueError(f"[{where}] for x(B,T,D) expected y(B,D). got x={tuple(x.shape)} y={tuple(y.shape)}")
-            if pos is not None:
-                if pos.dim() != 2 or pos.shape != (B, T):
-                    raise ValueError(f"[{where}] for x(B,T,D) expected pos(B,T). got pos={tuple(pos.shape)}")
-        else:
-            raise ValueError(f"[{where}] x must be 2D or 3D. got {tuple(x.shape)}")
-
-        # max_timestep guard (positional embedding range)
-        max_t = self._module().config["max_timestep"]
-        if T > max_t:
-            raise ValueError(f"[{where}] T={T} exceeds max_timestep={max_t}. Increase max_timestep in config.")
-
-    def _compute_loss(self, logits, y):
-        """
-        logits: (B,T,D) or (T,D)
-        y:      (B,D) or (D,)
-        We train "predict next frame" using last token prediction: logits[:, -1, :]
-        """
-        if logits.dim() == 2:
-            # (T,D)
-            pred = logits[-1]           # (D,)
-        elif logits.dim() == 3:
-            pred = logits[:, -1, :]     # (B,D)
-        else:
-            raise ValueError(f"logits must be 2D or 3D. got {tuple(logits.shape)}")
-
+        pred = logits[:, -1, :] if logits.dim() == 3 else logits[-1]
         loss = F.mse_loss(pred, y)
-
         if not torch.isfinite(loss):
             raise ValueError(f"Non-finite loss: {loss.item()}")
         return loss
 
-    # ---------------------------------------------------------
-    # Train (single GPU / non-DDP)
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
+
     def train(
         self,
         train_loader,
-        epochs=10,
+        epochs: int = 10,
         val_loader=None,
-        log_every=1,
-        best_path=None,
-        patience=10,
-        grad_clip_norm=1.0,
-        save_every_epochs=None,  # optional periodic save
-    ):
+        log_every: int = 1,
+        best_path: str = None,
+        patience: int = 10,
+        grad_clip_norm: float = 1.0,
+        save_every_epochs: int = None,
+    ) -> dict:
+        """
+        Train the model.
+
+        Args:
+            train_loader       : DataLoader yielding (x, _pos, y) batches.
+                                 _pos is unused — the model generates its own
+                                 positional indices internally.
+            epochs             : total training epochs
+            val_loader         : optional validation DataLoader (same format)
+            log_every          : log interval in epochs
+            best_path          : path prefix for best checkpoint (safetensors)
+            patience           : early-stop patience (epochs without improvement)
+            grad_clip_norm     : gradient clipping max norm (0 = disabled)
+            save_every_epochs  : if set, save a checkpoint every N epochs
+
+        Returns:
+            history dict with 'train_loss' (and 'val_loss' if val_loader given)
+        """
         history = {"train_loss": []}
         if val_loader is not None:
             history["val_loss"] = []
 
         best_metric = math.inf
-        best_epoch = 0
-        bad_epochs = 0
+        best_epoch  = 0
+        bad_epochs  = 0
 
         if best_path is None:
             best_path = os.path.join(self.ckpt_dir, "best_state_machine_gpt")
 
         for ep in range(1, epochs + 1):
-            # ---------- TRAIN ----------
+
+            # ---- TRAIN ----
             self.model.train()
-            total = 0.0
-            n = 0
+            total, n = 0.0, 0
 
             for batch in train_loader:
-                # dataset returns (x,pos,y)
-                x, pos, y = batch
+                # FIX 3: _pos is intentionally discarded — StateMachineGPT
+                # builds its own positional indices inside forward().
+                x, y = batch
 
-                # move
                 x = x.to(self.device)
                 y = y.to(self.device)
 
-                # guard: skip bad batches
-                if not torch.isfinite(x).all() or not torch.isfinite(y).all():
-                    # optional: print once to debug
-                    # print("Skipping non-finite batch")
-                    continue
-                # pos is not used, but move if you want to keep it around for debugging
-                # pos = pos.to(self.device)
+                if not (torch.isfinite(x).all() and torch.isfinite(y).all()):
+                    continue  # skip NaN/Inf batches
 
-                # forward
-                logits = self.model(x)               # (B,T,D) or (T,D)
-                loss = self._compute_loss(logits, y) * self.model.config.get("loss_scale", 1.0)
+                logits = self.model(x)
+                loss   = self._compute_loss(logits, y) * self.config.get("loss_scale", 1.0)
 
-                # backward
                 self.optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                if grad_clip_norm is not None and grad_clip_norm > 0:
+                if grad_clip_norm and grad_clip_norm > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_norm)
                 self.optimizer.step()
 
                 total += float(loss.item())
-                n += 1
+                n     += 1
 
             train_loss = total / max(n, 1)
             history["train_loss"].append(train_loss)
 
-            # ---------- VAL ----------
+            # ---- VALIDATION ----
             val_loss = None
             if val_loader is not None:
                 self.model.eval()
-                vtotal = 0.0
-                vn = 0
+                vtotal, vn = 0.0, 0
                 with torch.no_grad():
                     for batch in val_loader:
-                        x, pos, y = batch
-                        self._sanity_batch(x, pos, y, ep=ep, where="val")
-
+                        x, _pos, y = batch   # FIX 3: _pos discarded
                         x = x.to(self.device)
                         y = y.to(self.device)
-
-                        logits = self.model(x)
-                        loss = self._compute_loss(logits, y)
-
-                        vtotal += float(loss.item())
-                        vn += 1
-
+                        logits   = self.model(x)
+                        vtotal  += float(self._compute_loss(logits, y).item())
+                        vn      += 1
                 val_loss = vtotal / max(vn, 1)
                 history["val_loss"].append(val_loss)
 
-            # ---------- CHECKPOINT + EARLY STOP ----------
-            current_metric = val_loss if (val_loader is not None) else train_loss
+            # ---- CHECKPOINT + EARLY STOPPING ----
+            current_metric = val_loss if val_loader is not None else train_loss
 
             if current_metric < (best_metric - 1e-8):
                 best_metric = current_metric
-                best_epoch = ep
-                bad_epochs = 0
-
-                # save best (safetensors)
+                best_epoch  = ep
+                bad_epochs  = 0
                 self._module().save_safetensors(best_path)
                 if self._is_main():
-                    logger.info(f"[ckpt] saved best @ epoch {ep}: metric={best_metric:.6f} -> {best_path}")
+                    logger.info(f"[ckpt] saved best @ epoch {ep}: metric={best_metric:.6f}")
             else:
                 bad_epochs += 1
                 if bad_epochs >= patience:
                     if self._is_main():
-                        logger.info(f"[early stop] no improvement for {patience} epochs. best_epoch={best_epoch}, best_metric={best_metric:.6f}")
+                        logger.info(
+                            f"[early stop] no improvement for {patience} epochs. "
+                            f"best_epoch={best_epoch}, best_metric={best_metric:.6f}"
+                        )
                     break
 
-            # optional periodic save
-            if save_every_epochs is not None and (ep % save_every_epochs) == 0:
+            if save_every_epochs and (ep % save_every_epochs) == 0:
                 path = os.path.join(self.ckpt_dir, f"ep_{ep:04d}_state_machine_gpt")
                 self._module().save_safetensors(path)
 
-            # ---------- LOG ----------
-            if (ep % log_every) == 0:
+            # ---- LOG ----
+            if (ep % log_every) == 0 and self._is_main():
                 if val_loader is None:
-                    if self._is_main():
-                        logger.info(f"Epoch {ep}/{epochs} | train_loss={train_loss:.6f}")
+                    logger.info(f"Epoch {ep}/{epochs} | train_loss={train_loss:.6f}")
                 else:
-                    if self._is_main():
-                        logger.info(f"Epoch {ep}/{epochs} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f}")
+                    logger.info(
+                        f"Epoch {ep}/{epochs} | "
+                        f"train_loss={train_loss:.6f} | val_loss={val_loss:.6f}"
+                    )
 
         return history
 
-    # ---------------------------------------------------------
-    # Simple inference helper: given x -> predict next frame
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Inference helpers
+    # ------------------------------------------------------------------
+
     @torch.no_grad()
-    def predict_next(self, x):
+    def predict_next(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (T,D) or (B,T,D)
+        Predict the next pose frame.
+
+        Args:
+            x : (T, D) or (B, T, D)
+
         Returns:
-          next_pred: (D,) or (B,D)
+            (D,) or (B, D)
         """
         self.model.eval()
-        x = x.to(self.device)
+        x      = x.to(self.device)
         logits = self.model(x)
-
-        if logits.dim() == 2:
-            return logits[-1]          # (D,)
-        else:
-            return logits[:, -1, :]    # (B,D)
+        return logits[-1] if logits.dim() == 2 else logits[:, -1, :]

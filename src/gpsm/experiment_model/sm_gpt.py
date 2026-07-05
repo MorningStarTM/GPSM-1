@@ -4,111 +4,212 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 import os
 import json
-import numpy as np
-from collections import deque
 from src.gpsm.utils.logger import logger
 from src.gpsm.utils.utils import _to_jsonable
 from safetensors.torch import save_file, load_file
 
 
+# ---------------------------------------------------------------------------
+# Config validation helper
+# ---------------------------------------------------------------------------
+def _validate_config(config: dict):
+    """
+    Validate model config and auto-fix the head_size inconsistency.
+
+    FIX 1 — head_size:
+      Block used to compute head_size = n_embd // n_head locally, while
+      Head and MultiHeadAttention read config['head_size']. If those two
+      values differed the projection shape (head_size * n_head -> n_embd)
+      would silently mismatch. We now derive head_size from n_embd and
+      n_head here, overwriting whatever was in the config, and assert that
+      head_size * n_head == n_embd exactly.
+
+    FIX 2 — block_size:
+      block_size only needs to be >= the maximum sequence length T you will
+      ever feed (i.e. >= k+1 from the dataset). We document this here and
+      raise a clear error if it is too small rather than getting a silent
+      index-out-of-range inside the causal mask.
+    """
+    required = ["state_dim", "n_embd", "n_head", "n_layers",
+                "block_size", "dropout", "max_timestep", "learning_rate"]
+    for key in required:
+        if key not in config:
+            raise KeyError(f"Config missing required key: '{key}'")
+
+    n_embd = config["n_embd"]
+    n_head = config["n_head"]
+
+    if n_embd % n_head != 0:
+        raise ValueError(
+            f"n_embd ({n_embd}) must be divisible by n_head ({n_head})."
+        )
+
+    # FIX 1: derive head_size authoritatively and overwrite config entry
+    derived_head_size = n_embd // n_head
+    if "head_size" in config and config["head_size"] != derived_head_size:
+        logger.warning(
+            f"[config] head_size={config['head_size']} overridden to "
+            f"n_embd // n_head = {derived_head_size}. "
+            "Make sure head_size * n_head == n_embd."
+        )
+    config["head_size"] = derived_head_size  # single source of truth
+
+    # FIX 2: block_size must cover the full sequence length
+    # The causal mask is (block_size, block_size); at runtime we slice
+    # tril[:T, :T] so block_size >= T (= k+1 from the dataset).
+    # We can't know k here, but we can give a clear lower-bound message.
+    if config["block_size"] < 1:
+        raise ValueError("block_size must be >= 1.")
+
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Building blocks
+# ---------------------------------------------------------------------------
 
 class Head(nn.Module):
-    def __init__(self, config):
+    """Single causal self-attention head."""
+
+    def __init__(self, config: dict):
         super().__init__()
-        self.key = nn.Linear(config['n_embd'], config['head_size'], bias=False)
-        self.query = nn.Linear(config['n_embd'], config['head_size'], bias=False)
-        self.value = nn.Linear(config['n_embd'], config['head_size'], bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(config['block_size'], config['block_size'])))
-        self.dropout = nn.Dropout(config['dropout'])
+        # head_size is now guaranteed == n_embd // n_head by _validate_config
+        hs = config["head_size"]
+        self.key   = nn.Linear(config["n_embd"], hs, bias=False)
+        self.query = nn.Linear(config["n_embd"], hs, bias=False)
+        self.value = nn.Linear(config["n_embd"], hs, bias=False)
+        # block_size sets the max sequence length for the causal mask buffer.
+        # At runtime we slice tril[:T, :T] so the mask always matches the
+        # actual sequence length T <= block_size.
+        self.register_buffer(
+            "tril",
+            torch.tril(torch.ones(config["block_size"], config["block_size"]))
+        )
+        self.dropout = nn.Dropout(config["dropout"])
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.shape
+        k = self.key(x)    # (B, T, hs)
+        q = self.query(x)  # (B, T, hs)
 
-    def forward(self, x):
-        B,T,C = x.shape
-        k = self.key(x)
-        q = self.query(x)
-
-        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5   # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        # scaled dot-product attention with causal mask
+        wei = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5  # (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
         wei = F.softmax(wei, dim=-1)
         wei = self.dropout(wei)
 
-        v = self.value(x)
-        out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
-        return out
-
-
+        v = self.value(x)   # (B, T, hs)
+        return wei @ v      # (B, T, hs)
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(config) for _ in range(config['n_head'])])
-        self.proj = nn.Linear(config['head_size'] * config['n_head'], config['n_embd'])
-        self.dropout = nn.Dropout(config['dropout'])
+    """Multi-head causal self-attention."""
 
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
-        return out
-    
+    def __init__(self, config: dict):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(config) for _ in range(config["n_head"])])
+        # FIX 1: head_size * n_head == n_embd is now guaranteed, so this
+        # projection is always correctly shaped.
+        self.proj    = nn.Linear(config["head_size"] * config["n_head"], config["n_embd"])
+        self.dropout = nn.Dropout(config["dropout"])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.cat([h(x) for h in self.heads], dim=-1)  # (B, T, n_embd)
+        return self.dropout(self.proj(out))
 
 
 class FeedForward(nn.Module):
-    def __init__(self, config):
+    """Position-wise feed-forward block (4x expansion, ReLU)."""
+
+    def __init__(self, config: dict):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(config['n_embd'], 4 * config['n_embd']),
+            nn.Linear(config["n_embd"], 4 * config["n_embd"]),
             nn.ReLU(),
-            nn.Linear(4 * config['n_embd'], config['n_embd']),
-            nn.Dropout(config['dropout'])
+            nn.Linear(4 * config["n_embd"], config["n_embd"]),
+            nn.Dropout(config["dropout"]),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
-    
 
 
 class Block(nn.Module):
-    def __init__(self, config):
+    """
+    Transformer decoder block (pre-norm style).
+
+    FIX 1: head_size is no longer computed locally here. It is set once in
+    _validate_config (= n_embd // n_head) and passed through config, so
+    Head, MultiHeadAttention, and Block all use the same value.
+    """
+
+    def __init__(self, config: dict):
         super().__init__()
-        head_size = config['n_embd'] // config['n_head']
+        # head_size already in config (set by _validate_config) — no local override
         self.selfAttention = MultiHeadAttention(config)
         self.ffwd = FeedForward(config)
-        self.ln1 = nn.LayerNorm(config['n_embd'])
-        self.ln2 = nn.LayerNorm(config['n_embd'])
+        self.ln1  = nn.LayerNorm(config["n_embd"])
+        self.ln2  = nn.LayerNorm(config["n_embd"])
 
-    def forward(self, x):
-        y = self.selfAttention(x)
-        x = self.ln1(x + y)
-        y = self.ffwd(x)
-        x = self.ln2(x + y)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.ln1(x + self.selfAttention(x))
+        x = self.ln2(x + self.ffwd(x))
         return x
-    
 
+
+# ---------------------------------------------------------------------------
+# Main model
+# ---------------------------------------------------------------------------
 
 class StateMachineGPT(nn.Module):
-    def __init__(self, config):
+    """
+    GPT-style causal transformer for next-pose prediction.
+
+    Input  : obs (B, T, state_dim)  — window of T past poses
+    Output : logits (B, T, state_dim) — predicted pose at each step
+             (use logits[:, -1, :] for the actual next-frame prediction)
+
+    Config keys
+    -----------
+    state_dim      : dimensionality of one pose frame (e.g. 168 for SMPL-X)
+    n_embd         : transformer embedding dimension
+    n_head         : number of attention heads  (n_embd must be divisible by n_head)
+    n_layers       : number of transformer blocks
+    block_size     : maximum sequence length T the causal mask supports.
+                     Must be >= (k + 1) where k is your dataset window size.
+    dropout        : dropout probability
+    max_timestep   : size of the positional embedding table.
+                     Must be >= block_size (and >= T at inference).
+    learning_rate  : AdamW learning rate
+    loss_scale     : (optional) scalar multiplied onto the MSE loss (default 1.0)
+
+    Note — head_size is derived automatically as n_embd // n_head. You do
+    not need to set it in the config; if you do, it will be overwritten.
+    """
+
+    def __init__(self, config: dict):
         super().__init__()
+        # validate + fix config in-place before building any layers
+        config = _validate_config(dict(config))  # work on a copy
         self.config = config
-        self.prev_pos_embedding = nn.Linear(self.config['state_dim'], self.config['n_embd'])
 
-        self.relative_pos_embedding = nn.Embedding(self.config['max_timestep'], self.config['n_embd'])
-        self.blocks = nn.Sequential(*[Block(self.config) for _ in range(self.config['n_layers'])])
+        self.prev_pos_embedding    = nn.Linear(config["state_dim"], config["n_embd"])
+        self.relative_pos_embedding = nn.Embedding(config["max_timestep"], config["n_embd"])
+        self.blocks                = nn.Sequential(*[Block(config) for _ in range(config["n_layers"])])
+        self.ln_f                  = nn.LayerNorm(config["n_embd"])
+        self.next_pos_head         = nn.Linear(config["n_embd"], config["state_dim"])
 
-        self.ln_f = nn.LayerNorm(self.config['n_embd'])
-        self.next_pos_head = nn.Linear(self.config['n_embd'], config['state_dim'])
-        
-
-        self.optimizer = optim.AdamW(self.parameters(), lr=self.config['learning_rate'])
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.optimizer = optim.AdamW(self.parameters(), lr=config["learning_rate"])
+        self.device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.apply(self._init_weights)
 
+    # ------------------------------------------------------------------
+    # Weight initialisation
+    # ------------------------------------------------------------------
 
-    def _init_weights(self, module):
+    def _init_weights(self, module: nn.Module):
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -116,81 +217,76 @@ class StateMachineGPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, obs, targets=None):
+    # ------------------------------------------------------------------
+    # Forward pass
+    # ------------------------------------------------------------------
+
+    def forward(self, obs: torch.Tensor, targets=None) -> torch.Tensor:
         """
-        Supports:
-        - obs: (B, T, D)  batched sequences (recommended)
-        - obs: (T, D)     single sequence (will be auto-batched to B=1)
+        Args:
+            obs     : (B, T, D) or (T, D)
+            targets : unused — kept for API compatibility
 
         Returns:
-        - logits: (B, T, ...)   if batched input
-        - logits: (T, ...)      if single-seq input
+            logits  : same leading dims as obs, last dim = state_dim
         """
         if not torch.is_tensor(obs):
             raise TypeError(f"`obs` must be a torch.Tensor, got {type(obs)}")
 
         if obs.dim() == 2:
-            # (T, D) -> (1, T, D)
-            obs = obs.unsqueeze(0)
+            obs = obs.unsqueeze(0)   # (T, D) -> (1, T, D)
             squeeze_B = True
         elif obs.dim() == 3:
-            # (B, T, D)
             squeeze_B = False
         else:
-            raise ValueError(
-                f"`obs` must be 2D (T,D) or 3D (B,T,D). Got shape={tuple(obs.shape)}"
-            )
+            raise ValueError(f"`obs` must be 2D (T,D) or 3D (B,T,D). Got {tuple(obs.shape)}")
 
         B, T, D = obs.shape
 
-        # ---- sanity checks (optional but helpful)
         if T <= 0:
             raise ValueError(f"Sequence length T must be > 0, got T={T}")
-        if hasattr(self, "obs_dim"):
-            # if you store expected obs_dim in the model
-            if D != self.obs_dim:
-                raise ValueError(f"Expected obs feature dim D={self.obs_dim}, got D={D}")
+        if T > self.config["block_size"]:
+            raise ValueError(
+                f"T={T} exceeds block_size={self.config['block_size']}. "
+                "Increase block_size in config (must be >= your dataset window k+1)."
+            )
+        if T > self.config["max_timestep"]:
+            raise ValueError(
+                f"T={T} exceeds max_timestep={self.config['max_timestep']}. "
+                "Increase max_timestep in config."
+            )
 
-        # ---- embed observations
-        # Should accept (B,T,D) and output (B,T,n_embd)
-        obs_emb = self.prev_pos_embedding(obs)
+        obs_emb = self.prev_pos_embedding(obs)   # (B, T, n_embd)
 
-
-        # ---- positional embedding created inside the model (no need from dataset)
-        step = torch.arange(T, device=obs.device, dtype=torch.long).unsqueeze(0).expand(B, -1)  # (B,T)
-        pos_emb = self.relative_pos_embedding(step)
+        # positional embedding — generated inside the model, not from the dataset
+        step    = torch.arange(T, device=obs.device, dtype=torch.long).unsqueeze(0).expand(B, -1)
+        pos_emb = self.relative_pos_embedding(step)  # (B, T, n_embd)
 
         x = obs_emb + pos_emb
         x = self.blocks(x)
         x = self.ln_f(x)
-        logits = self.next_pos_head(x)
+        logits = self.next_pos_head(x)   # (B, T, state_dim)
 
-        # Return shape consistent with input style
         if squeeze_B:
-            logits = logits.squeeze(0)
-
+            logits = logits.squeeze(0)   # (T, state_dim)
         return logits
 
-    
+    # ------------------------------------------------------------------
+    # Inference helpers
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def predict_next(self, x_one: torch.Tensor, return_last_only: bool = True):
+    def predict_next(self, x_one: torch.Tensor, return_last_only: bool = True) -> torch.Tensor:
         """
-        Inference helper for a SINGLE sample.
+        Predict the next pose frame for a SINGLE sample.
 
         Args:
-            x_one: torch.Tensor of shape
-                - (T, D)  (single sequence)  OR
-                - (1, T, D) (already batched single sequence)
-            return_last_only: if True returns only the last-step prediction (next frame)
+            x_one           : (T, D) or (1, T, D)
+            return_last_only: True  -> return (D,) / (1,D) — the predicted next frame
+                              False -> return all (T,D) / (1,T,D) predictions
 
         Returns:
-            If return_last_only:
-                - (D,)    if input was (T,D)
-                - (1,D)   if input was (1,T,D)
-            Else:
-                - (T,D)   if input was (T,D)
-                - (1,T,D) if input was (1,T,D)
+            Tensor of shape (D,) if input was (T,D), or (1,D) if (1,T,D).
         """
         self.eval()
 
@@ -198,239 +294,166 @@ class StateMachineGPT(nn.Module):
             raise TypeError(f"x_one must be a torch.Tensor, got {type(x_one)}")
 
         if x_one.dim() == 2:
-            T, D = x_one.shape
-            x_in = x_one.unsqueeze(0)   # (1,T,D)
+            x_in = x_one.unsqueeze(0)   # (1, T, D)
             squeeze_B = True
         elif x_one.dim() == 3:
-            B, T, D = x_one.shape
-            if B != 1:
-                raise ValueError(f"predict_next expects a single sample (B=1). Got B={B}")
+            if x_one.shape[0] != 1:
+                raise ValueError(f"predict_next expects B=1, got B={x_one.shape[0]}")
             x_in = x_one
             squeeze_B = False
         else:
             raise ValueError(f"x_one must be (T,D) or (1,T,D). Got {tuple(x_one.shape)}")
 
-        # timestep range check for pos embedding
-        max_t = self.config["max_timestep"]
-        if T > max_t:
-            raise ValueError(f"T={T} exceeds max_timestep={max_t}. Increase config['max_timestep'].")
-
-        x_in = x_in.to(self.device)
-
-        logits = self.forward(x_in)      # (1,T,D)
+        x_in   = x_in.to(self.device)
+        logits = self.forward(x_in)   # (1, T, state_dim)
 
         if return_last_only:
-            pred_next = logits[:, -1, :]  # (1,D)
-            return pred_next.squeeze(0) if squeeze_B else pred_next
+            pred = logits[:, -1, :]              # (1, D)
+            return pred.squeeze(0) if squeeze_B else pred
         else:
             return logits.squeeze(0) if squeeze_B else logits
 
+    @torch.no_grad()
+    def rollout(self, seed_frames: torch.Tensor, n_steps: int) -> torch.Tensor:
+        """
+        Autoregressive generation: given seed_frames, predict n_steps future poses.
 
+        Args:
+            seed_frames : (T, D) — initial context window (T >= 1)
+            n_steps     : number of new frames to generate
 
+        Returns:
+            generated : (n_steps, D) — the predicted future frames only
+        """
+        self.eval()
+        if seed_frames.dim() != 2:
+            raise ValueError(f"seed_frames must be (T, D), got {tuple(seed_frames.shape)}")
+
+        window = seed_frames.to(self.device)   # (T, D)
+        k      = self.config["block_size"]     # max context window
+        preds  = []
+
+        for _ in range(n_steps):
+            ctx        = window[-k:]                   # trim to block_size
+            next_frame = self.predict_next(ctx)        # (D,)
+            preds.append(next_frame.unsqueeze(0))      # (1, D)
+            window = torch.cat([window, next_frame.unsqueeze(0)], dim=0)
+
+        return torch.cat(preds, dim=0)   # (n_steps, D)
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
 
     def print_param_size(self):
-        """
-        Print total number of parameters in millions.
-        """
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total     = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        logger.info(f"Total parameters      : {total / 1e6:.3f} M")
+        logger.info(f"Trainable parameters  : {trainable / 1e6:.3f} M")
 
-        logger.info(f"Total parameters      : {total_params / 1e6:.3f} M")
-        logger.info(f"Trainable parameters  : {trainable_params / 1e6:.3f} M")
-    
-
+    # ------------------------------------------------------------------
+    # Checkpoint helpers
+    # ------------------------------------------------------------------
 
     def save(self, path: str):
-        """
-        Save model + (optional) optimizer + config.
-        """
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        ckpt = {
-            "model_state_dict": self.state_dict(),
+        torch.save({
+            "model_state_dict":     self.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
-            "config": self.config
-        }
-        torch.save(ckpt, path)
+            "config":               self.config,
+        }, path)
 
     def load(self, path: str, device=None):
         if device is None:
             device = next(self.parameters()).device
-
         ckpt = torch.load(path, map_location=device)
-
-        # Optional safety check: config match
         if "config" in ckpt and ckpt["config"] != self.config:
-            raise ValueError("Checkpoint config != current model config (create model with same config before load).")
-
+            raise ValueError("Checkpoint config != current model config.")
         self.load_state_dict(ckpt["model_state_dict"])
-
-        if hasattr(self, "optimizer") and self.optimizer is not None and ckpt.get("optimizer_state_dict") is not None:
+        if self.optimizer is not None and ckpt.get("optimizer_state_dict"):
             self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            # move optimizer state tensors to device
             for state in self.optimizer.state.values():
                 for k, v in state.items():
                     if torch.is_tensor(v):
                         state[k] = v.to(device)
-
         logger.info(f"Loaded model from {path}.")
 
-    
-
-
     def save_safetensors(self, path: str, save_optimizer: bool = True):
-        """
-        Save model weights (always) + optimizer state tensors (optional) using safetensors.
-        Writes:
-          - {path}.safetensors
-          - {path}.json
-          - {path}.optim.safetensors   (optional)
-        """
-        base, ext = os.path.splitext(path)
-        if ext:  # user passed something like "ckpt.pt" -> use "ckpt"
-            base = base
+        base = os.path.splitext(path)[0]
         os.makedirs(os.path.dirname(base) or ".", exist_ok=True)
 
-        model_path = base + ".safetensors"
-        meta_path = base + ".json"
-        optim_path = base + ".optim.safetensors"
+        save_file({k: v.detach().cpu() for k, v in self.state_dict().items()}, base + ".safetensors")
 
-        # 1) model weights
-        model_sd = {k: v.detach().cpu() for k, v in self.state_dict().items()}
-        save_file(model_sd, model_path)
-
-        # 2) metadata (config + optimizer key structure)
         meta = {
             "format": "safetensors_ckpt_v1",
-            "config": _to_jsonable(getattr(self, "config", None)),
+            "config": _to_jsonable(self.config),
             "has_optimizer": False,
             "optimizer_state_keys": None,
         }
 
-        # 3) optimizer (optional, best-effort)
-        if save_optimizer and hasattr(self, "optimizer") and self.optimizer is not None:
+        if save_optimizer and self.optimizer is not None:
             try:
-                opt_sd = self.optimizer.state_dict()
-
-                # Flatten ONLY tensor parts of optimizer state into a safetensors dict
-                # Key format: state/{param_idx}/{state_key}
-                # (We keep "param_groups" + non-tensor scalars in JSON)
+                opt_sd      = self.optimizer.state_dict()
                 opt_tensors = {}
-                opt_state_keys = {}  # helps debug / validate
-                for param_idx, st in opt_sd.get("state", {}).items():
-                    param_idx_str = str(param_idx)
-                    opt_state_keys[param_idx_str] = []
+                opt_keys    = {}
+                opt_nontensor = {}
+
+                for pidx, st in opt_sd.get("state", {}).items():
+                    p = str(pidx)
+                    opt_keys[p]      = []
+                    opt_nontensor[p] = {}
                     for sk, sv in st.items():
                         if torch.is_tensor(sv):
-                            key = f"state/{param_idx_str}/{sk}"
-                            opt_tensors[key] = sv.detach().cpu()
-                            opt_state_keys[param_idx_str].append(sk)
+                            opt_tensors[f"state/{p}/{sk}"] = sv.detach().cpu()
+                            opt_keys[p].append(sk)
+                        else:
+                            opt_nontensor[p][sk] = _to_jsonable(sv)
 
-                # Save optimizer tensor state
-                save_file(opt_tensors, optim_path)
-
-                # Save remaining optimizer info in metadata
-                meta["has_optimizer"] = True
-                meta["optimizer_state_keys"] = opt_state_keys
-                meta["optimizer_param_groups"] = _to_jsonable(opt_sd.get("param_groups", []))
-
-                # Also save non-tensor optimizer scalars per param (e.g., step counts if ints)
-                # We store them to JSON so load can restore if desired.
-                opt_state_nontensor = {}
-                for param_idx, st in opt_sd.get("state", {}).items():
-                    p = str(param_idx)
-                    opt_state_nontensor[p] = {}
-                    for sk, sv in st.items():
-                        if not torch.is_tensor(sv):
-                            opt_state_nontensor[p][sk] = _to_jsonable(sv)
-                meta["optimizer_state_nontensor"] = opt_state_nontensor
-
+                save_file(opt_tensors, base + ".optim.safetensors")
+                meta.update({
+                    "has_optimizer":            True,
+                    "optimizer_state_keys":     opt_keys,
+                    "optimizer_param_groups":   _to_jsonable(opt_sd.get("param_groups", [])),
+                    "optimizer_state_nontensor": opt_nontensor,
+                })
             except Exception as e:
-                # If optimizer save fails, still save model + config
-                meta["has_optimizer"] = False
                 meta["optimizer_save_error"] = str(e)
 
-        with open(meta_path, "w", encoding="utf-8") as f:
+        with open(base + ".json", "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
 
     def load_safetensors(self, path: str, device=None, load_optimizer: bool = True, strict: bool = True):
-        """
-        Load model weights (+ optional optimizer state) from safetensors-based checkpoint.
-        Expects:
-          - {path}.safetensors
-          - {path}.json
-          - {path}.optim.safetensors   (optional)
-        """
         if device is None:
             device = next(self.parameters()).device
+        base = os.path.splitext(path)[0]
 
-        base, ext = os.path.splitext(path)
-        if ext:
-            base = base
-
-        model_path = base + ".safetensors"
-        meta_path = base + ".json"
-        optim_path = base + ".optim.safetensors"
-
-        # metadata (optional but recommended)
         meta = None
+        meta_path = base + ".json"
         if os.path.exists(meta_path):
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
+            if meta.get("config") is not None and meta["config"] != _to_jsonable(self.config):
+                raise ValueError("Checkpoint config != current model config.")
 
-            # Optional safety check: config match
-            if meta.get("config") is not None and hasattr(self, "config"):
-                if meta["config"] != _to_jsonable(self.config):
-                    raise ValueError("Checkpoint config != current model config (create model with same config before load).")
-
-        # load model weights
-        model_sd = load_file(model_path)  # tensors on CPU
-        model_sd = {k: v.to(device) for k, v in model_sd.items()}
+        model_sd = {k: v.to(device) for k, v in load_file(base + ".safetensors").items()}
         self.load_state_dict(model_sd, strict=strict)
 
-        # optimizer (best-effort)
-        if (
-            load_optimizer
-            and hasattr(self, "optimizer")
-            and self.optimizer is not None
-            and meta is not None
-            and meta.get("has_optimizer", False)
-            and os.path.exists(optim_path)
-        ):
+        optim_path = base + ".optim.safetensors"
+        if (load_optimizer and self.optimizer is not None
+                and meta and meta.get("has_optimizer") and os.path.exists(optim_path)):
             try:
                 opt_sd = self.optimizer.state_dict()
-
-                # Restore param_groups from meta (structure)
                 if "optimizer_param_groups" in meta:
                     opt_sd["param_groups"] = meta["optimizer_param_groups"]
-
-                # Restore non-tensor fields (if present)
                 if "optimizer_state_nontensor" in meta:
                     for pidx, fields in meta["optimizer_state_nontensor"].items():
                         pidx_int = int(pidx)
-                        if pidx_int not in opt_sd["state"]:
-                            opt_sd["state"][pidx_int] = {}
-                        opt_sd["state"][pidx_int].update(fields)
-
-                # Restore tensor fields from optim safetensors
-                opt_tensors = load_file(optim_path)  # CPU tensors
-                # Keys are state/{param_idx}/{state_key}
-                for key, tensor in opt_tensors.items():
+                        opt_sd["state"].setdefault(pidx_int, {}).update(fields)
+                for key, tensor in load_file(optim_path).items():
                     _, pidx, sk = key.split("/", 2)
-                    pidx_int = int(pidx)
-                    if pidx_int not in opt_sd["state"]:
-                        opt_sd["state"][pidx_int] = {}
-                    opt_sd["state"][pidx_int][sk] = tensor.to(device)
-
+                    opt_sd["state"].setdefault(int(pidx), {})[sk] = tensor.to(device)
                 self.optimizer.load_state_dict(opt_sd)
-
             except Exception as e:
-                # Don’t fail the whole load if optimizer restore breaks
-                # (torch version changes often break optimizer states)
-                if "logger" in globals():
-                    logger.warning(f"Loaded model but skipped optimizer restore due to: {e}")
-        if "logger" in globals():
-            logger.info(f"Loaded safetensors checkpoint from {base}.")
+                logger.warning(f"Skipped optimizer restore: {e}")
 
-
-
-
+        logger.info(f"Loaded safetensors checkpoint from {base}.")
