@@ -388,6 +388,7 @@ class MultiSMPLXNPZNextPoseDataset(Dataset):
         strict_dim: bool = False,
         preload: bool = False,
         min_frames: Optional[int] = None,
+        file_range: Optional[Tuple[int, int]] = None,
     ):
         super().__init__()
         self.k                          = int(k)
@@ -406,6 +407,18 @@ class MultiSMPLXNPZNextPoseDataset(Dataset):
         self.npz_paths = _as_path_list(npz_paths_or_dir, suffix=".npz")
         if not self.npz_paths:
             raise RuntimeError("No .npz files found.")
+
+        # file_range lets you train on a slice of the sorted file list
+        # (e.g. file_range=(0, 500), then (500, 1000), ...) instead of the
+        # whole dataset at once, so one epoch stays a manageable size.
+        if file_range is not None:
+            start, end = file_range
+            self.npz_paths = self.npz_paths[start:end]
+            if not self.npz_paths:
+                raise RuntimeError(
+                    f"file_range={file_range} selected no files out of "
+                    f"{len(_as_path_list(npz_paths_or_dir, suffix='.npz'))} total."
+                )
 
         self._files: List[Dict]            = []
         self._index: List[Tuple[int, int]] = []
