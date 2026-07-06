@@ -146,7 +146,7 @@ class SMTrainer:
                 vtotal, vn = 0.0, 0
                 with torch.no_grad():
                     for batch in val_loader:
-                        x, _pos, y = batch   # FIX 3: _pos discarded
+                        x, y = batch
                         x = x.to(self.device)
                         y = y.to(self.device)
                         logits   = self.model(x)
