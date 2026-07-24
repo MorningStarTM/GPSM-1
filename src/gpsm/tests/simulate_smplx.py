@@ -93,7 +93,12 @@ def build_forward_kwargs(npz: dict, num_frames: int, num_betas: int, device: str
     def as_tensor(arr: np.ndarray) -> torch.Tensor:
         return torch.as_tensor(np.asarray(arr, dtype=np.float32), device=device)
 
-    have_direct = any(k in npz for k in DIRECT_KEY_MAP) or "pose_hand" in npz or "pose_eye" in npz
+    # `trans` deliberately excluded from this check — a dict with only
+    # `poses` + `trans` (e.g. a model rollout prediction) must still take
+    # the `poses`-slicing fallback below, not be misread as "direct fields
+    # present" just because `trans` happens to also be a DIRECT_KEY_MAP key.
+    pose_direct_keys = ("root_orient", "pose_body", "pose_jaw")
+    have_direct = any(k in npz for k in pose_direct_keys) or "pose_hand" in npz or "pose_eye" in npz
 
     if have_direct:
         for npz_key, arg_name in DIRECT_KEY_MAP.items():
