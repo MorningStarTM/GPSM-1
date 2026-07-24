@@ -209,3 +209,4 @@ __marimo__/
 /notebook/
 /checkpoints/
 /model/
+/src/gpsm/tests/output/
