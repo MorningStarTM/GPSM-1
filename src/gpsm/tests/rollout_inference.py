@@ -42,7 +42,7 @@ import torch
 from src.gpsm.experiment_model.sm_gpt import StateMachineGPT
 from src.gpsm.tests.frame_loader import load_sequence_features
 from src.gpsm.tests.visualize_npz import load_npz, animate_joints, plot_pose_curves
-from src.gpsm.tests.simulate_smplx import build_forward_kwargs, resolve_gender
+from src.gpsm.tests.simulate_smplx import build_forward_kwargs, resolve_gender, animate_mesh
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +137,7 @@ def simulate_prediction(
     out_dir: str = "src/gpsm/tests/output",
     device: Optional[str] = None,
     keep_root_motion: bool = False,
+    with_mesh: bool = False,
 ) -> None:
     out_dir_p = Path(out_dir)
     out_dir_p.mkdir(parents=True, exist_ok=True)
@@ -217,16 +218,26 @@ def simulate_prediction(
     )
 
     with torch.no_grad():
-        output = body_model(return_verts=False, **fwd_kwargs)
+        output = body_model(return_verts=with_mesh, **fwd_kwargs)
 
     joints = output.joints.detach().cpu().numpy()
+    root = joints[:, [0], :]
     if not keep_root_motion:
-        joints = joints - joints[:, [0], :]
+        joints = joints - root
 
     animate_joints(
         joints, out_dir_p / f"{stem}_rollout_joints.gif", fps=fps,
         title=f"{stem} — seed + {n_steps}-step rollout (SMPL-X, {resolved_gender})",
     )
+
+    if with_mesh:
+        vertices = output.vertices.detach().cpu().numpy()
+        if not keep_root_motion:
+            vertices = vertices - root
+        animate_mesh(
+            vertices, body_model.faces, out_dir_p / f"{stem}_rollout_mesh.gif", fps=fps,
+            title=f"{stem} — seed + {n_steps}-step rollout (SMPL-X, {resolved_gender})",
+        )
 
 
 def main() -> None:
@@ -248,6 +259,8 @@ def main() -> None:
     parser.add_argument("--fps", type=int, default=8, help="Animation fps (kept low — only a few predicted frames)")
     parser.add_argument("--out", default="src/gpsm/tests/output")
     parser.add_argument("--keep-root-motion", action="store_true")
+    parser.add_argument("--mesh", action="store_true",
+                         help="Also render the full SMPL-X body mesh, not just joints (requires --model-folder)")
     args = parser.parse_args()
 
     simulate_prediction(
@@ -263,6 +276,7 @@ def main() -> None:
         out_dir=args.out,
         device=args.device,
         keep_root_motion=args.keep_root_motion,
+        with_mesh=args.mesh,
     )
 
 
