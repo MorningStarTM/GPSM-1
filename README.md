@@ -30,23 +30,17 @@ denormalized and passed through the real SMPL-X body model (forward kinematics) 
 recover 3D joint positions and a posed mesh. Both columns below are the *same*
 9-frame predicted sequence (1 seed + 8 predicted), just rendered two ways:
 
-<table>
-<tr>
-<th>Joints (skeleton)</th>
-<th>Mesh (SMPL-X body)</th>
-</tr>
-<tr>
-<td><img src="https://github.com/MorningStarTM/GPSM-1/blob/5ffd64cdefd5664d286c25b9b1d1414c2157e4d4/assets/12_L_2_stageii_rollout_joints.gif" width="380"/></td>
-<td><img src="https://github.com/MorningStarTM/GPSM-1/blob/5ffd64cdefd5664d286c25b9b1d1414c2157e4d4/assets/12_L_2_stageii_rollout_mesh.gif" width="380"/></td>
-</tr>
-</table>
+
+| **Joints (skeleton)** | **Mesh (SMPL-X body)** |
+|---------|-------------|
+|![App Screenshot](https://github.com/MorningStarTM/GPSM-1/blob/5ffd64cdefd5664d286c25b9b1d1414c2157e4d4/assets/12_L_2_stageii_rollout_joints.gif)|![App Screenshot](https://github.com/MorningStarTM/GPSM-1/blob/5ffd64cdefd5664d286c25b9b1d1414c2157e4d4/assets/12_L_2_stageii_rollout_mesh.gif)
 
 Reproduce it with:
 
 ```
 python -m src.gpsm.tests.rollout_inference data/12_L_2_stageii.npz \
-    --checkpoint checkpoints/best_sm --n-steps 8 \
-    --model-folder model/SMPLX_FEMALE.npz --mesh --fps 4
+    --checkpoint checkpoints/best_sm --n-steps 128 \
+    --model-folder model/SMPLX_FEMALE.npz --mesh --fps 8
 ```
 
 This checkpoint is only lightly trained — the purpose of this demo is to validate
