@@ -36,8 +36,8 @@ recover 3D joint positions and a posed mesh. Both columns below are the *same*
 <th>Mesh (SMPL-X body)</th>
 </tr>
 <tr>
-<td><img src="assets/12_L_2_stageii_rollout_joints.gif" width="380"/></td>
-<td><img src="assets/12_L_2_stageii_rollout_mesh.gif" width="380"/></td>
+<td><img src="https://github.com/MorningStarTM/GPSM-1/blob/5ffd64cdefd5664d286c25b9b1d1414c2157e4d4/assets/12_L_2_stageii_rollout_joints.gif" width="380"/></td>
+<td><img src="https://github.com/MorningStarTM/GPSM-1/blob/5ffd64cdefd5664d286c25b9b1d1414c2157e4d4/assets/12_L_2_stageii_rollout_mesh.gif" width="380"/></td>
 </tr>
 </table>
 
