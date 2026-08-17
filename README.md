@@ -10,6 +10,51 @@ dynamics of human movement directly from mocap sequences: given a short window o
 past poses, it predicts the next pose. Chained autoregressively, this turns into a
 generative motion model that can roll a character forward frame by frame.
 
+## Demo — trained-model inference (next-frame rollout)
+
+The clips below are the **trained checkpoint** (`checkpoints/best_sm`) actually
+running inference — not ground-truth mocap. The model is seeded with a single real
+pose frame from a held-out `.npz` sequence, then repeatedly predicts its own next
+frame and feeds that prediction back in as the next input. This is exactly the
+next-token generation loop a language-model GPT runs at inference time — predict
+one step ahead, append it to the context, repeat — except each "token" here is a
+continuous SMPL-X pose vector instead of a discrete word. Concretely, this is
+`StateMachineGPT.rollout(seed_frames, n_steps)`
+([sm_gpt.py](src/gpsm/experiment_model/sm_gpt.py)): **1 seed frame in, 8
+autoregressively generated frames out**, with no ground truth fed in after the
+first frame.
+
+The model itself only outputs a normalized 168-dim vector (SMPL-X `poses` +
+`trans`) — not something directly visual. To inspect it, each predicted frame is
+denormalized and passed through the real SMPL-X body model (forward kinematics) to
+recover 3D joint positions and a posed mesh. Both columns below are the *same*
+9-frame predicted sequence (1 seed + 8 predicted), just rendered two ways:
+
+<table>
+<tr>
+<th>Joints (skeleton)</th>
+<th>Mesh (SMPL-X body)</th>
+</tr>
+<tr>
+<td><img src="assets/12_L_2_stageii_rollout_joints.gif" width="380"/></td>
+<td><img src="assets/12_L_2_stageii_rollout_mesh.gif" width="380"/></td>
+</tr>
+</table>
+
+Reproduce it with:
+
+```
+python -m src.gpsm.tests.rollout_inference data/12_L_2_stageii.npz \
+    --checkpoint checkpoints/best_sm --n-steps 8 \
+    --model-folder model/SMPLX_FEMALE.npz --mesh --fps 4
+```
+
+This checkpoint is only lightly trained — the purpose of this demo is to validate
+the **inference pipeline end-to-end** (seed frame → autoregressive rollout →
+denormalization → SMPL-X forward kinematics → render), not to showcase polished
+motion quality yet. See [`tests/` — inference & visualization
+tooling](#tests--inference--visualization-tooling) below for how each piece works.
+
 ## Idea
 
 Classic game-animation state machines (walk → run → jump → land, ...) are built by
@@ -60,9 +105,7 @@ Key points:
 - **Output head** regresses directly to a `state_dim`-sized pose vector (not a
   softmax over a vocabulary) — this is a regression model trained with MSE loss, not
   a classification model trained with cross-entropy.
-- `head_size` is always derived as `n_embd // n_head` and validated/overwritten by
-  `_validate_config()` so `Head`, `MultiHeadAttention`, and `Block` can never disagree
-  on the projection shape.
+
 
 ### Config keys
 
@@ -89,14 +132,21 @@ Key points:
 
 ```
 main.py                                  example training entrypoint
+assets/                                  README demo GIFs
+model/                                   (local) downloaded SMPL-X model weights — not checked in
 src/gpsm/
 ├── experiment_model/
 │   ├── sm_gpt.py                        StateMachineGPT model + config validation
 │   └── sm_gpt_trainer.py                SMTrainer: training/validation loop
-└── utils/
-    ├── dataset.py                       mocap → (x, y) window datasets
-    ├── logger.py                        loguru-based file + console logger
-    └── utils.py                         small config/JSON helpers
+├── utils/
+│   ├── dataset.py                       mocap → (x, y) window datasets
+│   ├── logger.py                        loguru-based file + console logger
+│   └── utils.py                         small config/JSON helpers
+└── tests/
+    ├── frame_loader.py                  npz → model-ready feature frame(s)
+    ├── visualize_npz.py                 raw npz inspection/plots (no SMPL-X needed)
+    ├── simulate_smplx.py                ground-truth npz -> SMPL-X forward kinematics -> GIF
+    └── rollout_inference.py             trained checkpoint -> autoregressive rollout -> SMPL-X GIF
 ```
 
 ### `sm_gpt.py` — model
@@ -158,6 +208,39 @@ Shared behavior:
 - `logger` — a preconfigured `loguru` logger that writes timestamped, rotating log
   files to `logs/` and also mirrors messages to stdout.
 
+### `tests/` — inference & visualization tooling
+
+Scripts for inspecting data and testing a trained model by actually running it,
+rather than just reading loss numbers. All are runnable as modules
+(`python -m src.gpsm.tests.<name> ...`) and write their output (GIFs/PNGs) to
+`src/gpsm/tests/output/` by default.
+
+- **`frame_loader.py`** — `load_sequence_features(npz_path, ...)` /
+  `get_first_frame(npz_path, ...)`: builds the `(T, D)` feature matrix (or just
+  frame `0`) for one `.npz` file, using the *same* feature construction and
+  per-file z-score normalization as `MultiSMPLXNPZNextPoseDataset`, so a frame
+  pulled here is numerically identical to what the model saw during training.
+  Also returns the per-file `mean`/`std` needed to denormalize model output back
+  to real pose values.
+- **`visualize_npz.py`** — quick, dependency-light inspection of a raw `.npz`
+  file: prints all keys/shapes, animates `trans` (root motion path) or
+  `joints3d` if present, and plots a `poses` heatmap over time. No SMPL-X model
+  required.
+- **`simulate_smplx.py`** — runs a **ground-truth** mocap sequence through the
+  real SMPL-X body model (global_orient/body_pose/hand/jaw/eye pose → forward
+  kinematics) and animates the result as joints and/or a full posed mesh.
+  Requires the `smplx` pip package and SMPL-X model weights, which are licensed
+  and must be downloaded by hand after registering at
+  [smpl-x.is.tue.mpg.de](https://smpl-x.is.tue.mpg.de) — see the module
+  docstring for the exact folder layout expected.
+- **`rollout_inference.py`** — the trained-model inference test: loads a
+  checkpoint (config + weights from `<checkpoint>.json` / `.safetensors`), seeds
+  `StateMachineGPT.rollout()` with the first real frame of a chosen `.npz` file,
+  autoregressively predicts `n_steps` future frames, denormalizes them, and
+  (optionally, given `--model-folder`) renders the predicted sequence through
+  SMPL-X the same way `simulate_smplx.py` does. This is what produced the demo
+  GIFs at the top of this README.
+
 ## Quickstart
 
 ```python
@@ -201,11 +284,22 @@ out) `MultiC3DNextPoseDataset` path for raw `.c3d` marker data.
 
 ## Dependencies
 
+Core (training):
+
 - `torch`
 - `numpy`
 - `loguru`
 - `safetensors`
 - `ezc3d` (only required for the `.c3d` marker-based dataset path)
+
+`tests/` tooling (data inspection, inference demo, SMPL-X visualization):
+
+- `matplotlib` — all GIF/PNG rendering
+- `smplx` — only for `simulate_smplx.py` / `rollout_inference.py`'s `--model-folder`
+  path (real forward-kinematics visualization). Also requires SMPL-X model
+  weights, which are licensed and must be downloaded by hand from
+  [smpl-x.is.tue.mpg.de](https://smpl-x.is.tue.mpg.de) after registering — see
+  `simulate_smplx.py`'s module docstring for the exact steps and folder layout.
 
 No `requirements.txt` is checked in yet — install the above via `pip` as needed for
 your environment (e.g. Kaggle notebooks).
