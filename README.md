@@ -38,9 +38,7 @@ recover 3D joint positions and a posed mesh. Both columns below are the *same*
 Reproduce it with:
 
 ```
-python -m src.gpsm.tests.rollout_inference data/12_L_2_stageii.npz \
-    --checkpoint checkpoints/best_sm --n-steps 128 \
-    --model-folder model/SMPLX_FEMALE.npz --mesh --fps 8
+python -m src.gpsm.tests.rollout_inference data/0019_lifting_heavy1_poses.npz --checkpoint checkpoints/best_sm --n-steps 128 --model-folder model/SMPLX_FEMALE.npz --mesh --fps 8
 ```
 
 This checkpoint is only lightly trained — the purpose of this demo is to validate
@@ -139,8 +137,9 @@ src/gpsm/
 └── tests/
     ├── frame_loader.py                  npz → model-ready feature frame(s)
     ├── visualize_npz.py                 raw npz inspection/plots (no SMPL-X needed)
-    ├── simulate_smplx.py                ground-truth npz -> SMPL-X forward kinematics -> GIF
-    └── rollout_inference.py             trained checkpoint -> autoregressive rollout -> SMPL-X GIF
+    ├── simulate_smplx.py                any npz clip -> SMPL-X forward kinematics -> GIF
+    ├── rollout_inference.py             trained checkpoint -> autoregressive rollout -> SMPL-X GIF
+    └── ground_truth_inference.py        same npz clip, real frames (no model) -> SMPL-X GIF
 ```
 
 ### `sm_gpt.py` — model
@@ -234,6 +233,33 @@ rather than just reading loss numbers. All are runnable as modules
   (optionally, given `--model-folder`) renders the predicted sequence through
   SMPL-X the same way `simulate_smplx.py` does. This is what produced the demo
   GIFs at the top of this README.
+- **`ground_truth_inference.py`** — the ground-truth counterpart to
+  `rollout_inference.py`: takes the *actual recorded* frames
+  `[start : start + n_frames]` straight from an `.npz` file (no model, no
+  normalization) and renders them through SMPL-X the same way, producing a
+  joints GIF and a mesh GIF. Used to compare "what the model predicted" against
+  "what really happened" over the identical frame range — see below.
+
+#### Comparing model prediction vs. ground truth
+
+Run both scripts on the same file with matching frame counts (`--n-steps N` on
+one, `--n-frames N+1` on the other — `+1` because the ground-truth clip
+includes the shared seed frame that the rollout also starts from) and play the
+resulting GIFs side by side:
+
+```
+python -m src.gpsm.tests.rollout_inference data/12_L_2_stageii.npz \
+    --checkpoint checkpoints/best_sm --n-steps 8 \
+    --model-folder model/SMPLX_FEMALE.npz --mesh --fps 4
+# -> 12_L_2_stageii_rollout_joints.gif, 12_L_2_stageii_rollout_mesh.gif
+
+python -m src.gpsm.tests.ground_truth_inference data/12_L_2_stageii.npz --n-frames 128 --model-folder model/SMPLX_FEMALE.npz --fps 26
+# -> 12_L_2_stageii_groundtruth_joints.gif, 12_L_2_stageii_groundtruth_mesh.gif
+```
+
+`--start` (default `0`) picks which real frame the ground-truth clip begins at,
+in case you want to compare against a rollout seeded from somewhere other than
+frame 0.
 
 ## Quickstart
 
