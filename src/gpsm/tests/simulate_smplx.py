@@ -73,16 +73,28 @@ DIRECT_KEY_MAP = {
     "trans":       "transl",
 }
 
-# Fallback slice offsets into the combined `poses` (T, 165) array, following
-# the standard AMASS SMPL-X layout: [root_orient(3), pose_body(63),
-# pose_jaw(3), pose_eye(6), pose_hand(90)]. Only used when the individual
-# fields above are missing from the npz.
-POSES_FALLBACK_SLICES = {
-    "global_orient": slice(0, 3),
-    "body_pose":      slice(3, 66),
-    "jaw_pose":       slice(66, 69),
-    "pose_eye":       slice(69, 75),   # further split into leye/reye below
-    "pose_hand":      slice(75, 165),  # further split into left/right below
+# Fallback slice offsets into the combined `poses` array, keyed by its total
+# width — only used when the individual fields (root_orient/pose_body/...)
+# are missing from the npz. Different AMASS sub-datasets were converted to
+# SMPL-X at different times with different pose layouts:
+#   165 = root_orient(3) + pose_body(63) + pose_jaw(3) + pose_eye(6) + pose_hand(90)
+#         (full — face + hands; e.g. this repo's local data/*.npz)
+#   156 = root_orient(3) + pose_body(63) + pose_hand(90)
+#         (hands only, no face pose at all — e.g. AMASS "bmlrub")
+# Add more entries here if you encounter another SMPL-X poses width.
+POSES_LAYOUTS = {
+    165: {
+        "global_orient": slice(0, 3),
+        "body_pose":     slice(3, 66),
+        "jaw_pose":      slice(66, 69),
+        "pose_eye":      slice(69, 75),   # further split into leye/reye below
+        "pose_hand":     slice(75, 165),  # further split into left/right below
+    },
+    156: {
+        "global_orient": slice(0, 3),
+        "body_pose":     slice(3, 66),
+        "pose_hand":     slice(66, 156),  # further split into left/right below
+    },
 }
 
 
@@ -116,14 +128,21 @@ def build_forward_kwargs(npz: dict, num_frames: int, num_betas: int, device: str
                 kwargs["reye_pose"] = as_tensor(pose_eye[:, 3:])
     elif "poses" in npz:
         poses = np.asarray(npz["poses"], dtype=np.float32)
-        kwargs["global_orient"] = as_tensor(poses[:, POSES_FALLBACK_SLICES["global_orient"]])
-        kwargs["body_pose"]     = as_tensor(poses[:, POSES_FALLBACK_SLICES["body_pose"]])
-        if poses.shape[-1] >= 165:
-            kwargs["jaw_pose"] = as_tensor(poses[:, POSES_FALLBACK_SLICES["jaw_pose"]])
-            eye = poses[:, POSES_FALLBACK_SLICES["pose_eye"]]
+        layout = POSES_LAYOUTS.get(poses.shape[-1])
+        if layout is None:
+            raise ValueError(
+                f"Unrecognized 'poses' width {poses.shape[-1]} — expected one of "
+                f"{sorted(POSES_LAYOUTS)} (see POSES_LAYOUTS). Add a new entry there "
+                "if this is a different SMPL-X pose variant."
+            )
+        kwargs["global_orient"] = as_tensor(poses[:, layout["global_orient"]])
+        kwargs["body_pose"]     = as_tensor(poses[:, layout["body_pose"]])
+        if "jaw_pose" in layout:
+            kwargs["jaw_pose"] = as_tensor(poses[:, layout["jaw_pose"]])
+            eye = poses[:, layout["pose_eye"]]
             kwargs["leye_pose"], kwargs["reye_pose"] = as_tensor(eye[:, :3]), as_tensor(eye[:, 3:])
-            hand = poses[:, POSES_FALLBACK_SLICES["pose_hand"]]
-            kwargs["left_hand_pose"], kwargs["right_hand_pose"] = as_tensor(hand[:, :45]), as_tensor(hand[:, 45:])
+        hand = poses[:, layout["pose_hand"]]
+        kwargs["left_hand_pose"], kwargs["right_hand_pose"] = as_tensor(hand[:, :45]), as_tensor(hand[:, 45:])
         if "trans" in npz:
             kwargs["transl"] = as_tensor(npz["trans"])
     else:

@@ -144,7 +144,7 @@ def simulate_prediction(
     stem = Path(npz_path).stem
 
     result = rollout_from_first_frame(npz_path, checkpoint_path, n_steps=n_steps, device=device)
-    sequence = result["sequence_denorm"]  # (n_steps+1, D) = poses(165) + trans(3)
+    sequence = result["sequence_denorm"]  # (n_steps+1, D) = poses(width varies by SMPL-X data variant) + trans(3)
 
     print(f"Seed frame + {n_steps} autoregressive predictions "
           f"(sequence shape {sequence.shape})")
@@ -160,11 +160,11 @@ def simulate_prediction(
               "(pose-curve plot above is the only output).")
         return
 
-    if sequence.shape[1] != 168:
+    if sequence.shape[1] < 3:
         raise ValueError(
-            f"SMPL-X visualization expects poses(165)+trans(3)=168-dim features, "
-            f"got D={sequence.shape[1]}. Re-run without --model-folder to still "
-            "get the pose-curve plot."
+            f"SMPL-X visualization expects poses+trans features (trans alone is "
+            f"3-dim), got D={sequence.shape[1]}. Re-run without --model-folder to "
+            "still get the pose-curve plot."
         )
 
     try:
@@ -172,8 +172,12 @@ def simulate_prediction(
     except ImportError as e:
         raise ImportError("The `smplx` package is not installed. Run: pip install smplx") from e
 
-    poses = sequence[:, :165]
-    trans = sequence[:, 165:168]
+    # `trans` is always the last 3 dims (feature_set="poses+trans" concatenates
+    # poses then trans); `poses` width varies by SMPL-X data variant (165-dim
+    # full face+hands, 156-dim hands-only, ...) — build_forward_kwargs below
+    # raises a clear error if the resulting poses width isn't a recognized layout.
+    poses = sequence[:, :-3]
+    trans = sequence[:, -3:]
 
     npz_orig = load_npz(Path(npz_path))
     fake_npz = {"poses": poses, "trans": trans}
