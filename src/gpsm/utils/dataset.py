@@ -519,3 +519,172 @@ class MultiSMPLXNPZNextPoseDataset(Dataset):
                 for r in self._files
             ],
         }
+
+
+# ---------------------------------------------------------------------------
+# SMPL-X multi-file dataset — supervised fine-tuning (autoregressive rollout)
+# ---------------------------------------------------------------------------
+
+class MultiSMPLXNPZSFTDataset(Dataset):
+    """
+    Supervised fine-tuning counterpart to MultiSMPLXNPZNextPoseDataset.
+
+    MultiSMPLXNPZNextPoseDataset trains "given k history frames, predict the
+    single next frame" (teacher-forced, one step). This dataset instead
+    supervises the model's own multi-step autoregressive rollout — mirroring
+    how an LLM is fine-tuned to generate a whole completion, not just the
+    next token: given a single seed frame, the model must free-run its own
+    predictions forward for `n_frames` steps, and every one of those
+    predicted frames is scored against the real recorded continuation.
+
+    Each sample:
+      seed   : (D,)          — the single frame to start generating from
+      target : (n_frames, D) — the real frames that actually followed it
+    """
+
+    def __init__(
+        self,
+        npz_paths_or_dir: Union[str, Path, Sequence[Union[str, Path]]],
+        n_frames: int,
+        *,
+        feature_set: str = "poses+trans",
+        prefer_joints_if_available: bool = False,
+        include_betas: bool = False,
+        include_dmpls: bool = False,
+        include_expression: bool = False,
+        include_face: bool = False,
+        fill_nan: bool = True,
+        normalize: bool = True,
+        strict_dim: bool = False,
+        preload: bool = False,
+        min_frames: Optional[int] = None,
+        file_range: Optional[Tuple[int, int]] = None,
+    ):
+        super().__init__()
+        self.n_frames                   = int(n_frames)
+        self.feature_set                = feature_set
+        self.prefer_joints_if_available = prefer_joints_if_available
+        self.include_betas              = include_betas
+        self.include_dmpls              = include_dmpls
+        self.include_expression         = include_expression
+        self.include_face               = include_face
+        self.fill_nan                   = fill_nan
+        self.normalize                  = normalize
+        self.strict_dim                 = strict_dim
+        self.preload                    = preload
+
+        if self.n_frames < 1:
+            raise ValueError(f"n_frames must be >= 1, got {n_frames}")
+
+        self.npz_paths = _as_path_list(npz_paths_or_dir, suffix=".npz")
+        if not self.npz_paths:
+            raise RuntimeError("No .npz files found.")
+
+        # Same chunked-training mechanism as MultiSMPLXNPZNextPoseDataset.
+        if file_range is not None:
+            start, end = file_range
+            self.npz_paths = self.npz_paths[start:end]
+            if not self.npz_paths:
+                raise RuntimeError(
+                    f"file_range={file_range} selected no files out of "
+                    f"{len(_as_path_list(npz_paths_or_dir, suffix='.npz'))} total."
+                )
+
+        self._files: List[Dict]            = []
+        self._index: List[Tuple[int, int]] = []
+        self.D: Optional[int]              = None
+
+        # Need 1 seed frame + n_frames target frames = n_frames + 1 total.
+        min_needed = max(self.n_frames + 1, int(min_frames) if min_frames else self.n_frames + 1)
+
+        for p in self.npz_paths:
+            try:
+                npz  = _safe_npz_load(p)
+                X, info = build_smplx_features(
+                    npz,
+                    feature_set=self.feature_set,
+                    include_betas=self.include_betas,
+                    include_dmpls=self.include_dmpls,
+                    include_expression=self.include_expression,
+                    include_face=self.include_face,
+                    prefer_joints_if_available=self.prefer_joints_if_available,
+                )
+
+                if self.fill_nan:
+                    X = forward_fill_nan_2d(X, fill_value=0.0)
+
+                T, D = X.shape
+                if T < min_needed:
+                    continue
+
+                if self.normalize:
+                    mean = X.mean(axis=0, keepdims=True)
+                    std  = X.std(axis=0, keepdims=True) + 1e-6
+                    Xn   = (X - mean) / std
+                else:
+                    mean = std = None
+                    Xn = X
+
+                if self.D is None:
+                    self.D = D
+                elif D != self.D:
+                    if self.strict_dim:
+                        raise ValueError(f"[dim mismatch] {p}: D={D}, expected D={self.D}")
+                    continue
+
+                # Valid seed indices t: seed=X[t], target=X[t+1 : t+1+n_frames]
+                # both need to stay in bounds, i.e. t + n_frames <= T - 1.
+                valid_t  = list(range(0, T - self.n_frames))
+                file_i   = len(self._files)
+                self._files.append({
+                    "path":         p,
+                    "T":            T,
+                    "D":            D,
+                    "valid_t":      valid_t,
+                    "mean":         mean,
+                    "std":          std,
+                    "feature_info": info,
+                    "X_np":         Xn if not self.preload else None,
+                    "X":            torch.from_numpy(Xn).float() if self.preload else None,
+                })
+                for local_i in range(len(valid_t)):
+                    self._index.append((file_i, local_i))
+
+            except Exception:
+                continue
+
+        if not self._files:
+            raise RuntimeError(
+                "No valid .npz files loaded. "
+                "Common causes: missing 'poses'/'trans' keys, sequences too short "
+                "(need >= n_frames + 1 frames), or feature-dimension mismatches across files."
+            )
+
+    def __len__(self) -> int:
+        return len(self._index)
+
+    def __getitem__(self, idx: int):
+        """
+        Returns:
+            seed   : (D,)          — frame to start the rollout from
+            target : (n_frames, D) — the real frames that followed it
+        """
+        file_i, local_i = self._index[idx]
+        rec = self._files[file_i]
+        t   = rec["valid_t"][local_i]
+
+        X      = rec["X"] if self.preload else torch.from_numpy(rec["X_np"]).float()
+        seed   = X[t]                              # (D,)
+        target = X[t + 1 : t + 1 + self.n_frames]  # (n_frames, D)
+        return seed, target
+
+    def file_stats(self) -> Dict:
+        return {
+            "num_files":   len(self._files),
+            "num_samples": len(self._index),
+            "D":           self.D,
+            "files": [
+                (str(r["path"]), r["T"], len(r["valid_t"]), r["feature_info"])
+                for r in self._files
+            ],
+        }
