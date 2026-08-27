@@ -1,0 +1,209 @@
+import os
+import math
+import torch
+import torch.nn.functional as F
+from src.gpsm.experiment_model.sm_gpt import StateMachineGPT
+from src.gpsm.utils.logger import logger
+
+
+class SFTTrainer:
+    """
+    Supervised fine-tuning trainer for StateMachineGPT.
+
+    SMTrainer (sm_gpt_trainer.py) is the pretraining phase: teacher-forced,
+    single-step "given k history frames, predict the one next frame" — the
+    model never sees its own predictions during training.
+
+    SFTTrainer is the next phase: given a single seed frame, the model must
+    free-run its own predictions forward for `n_frames` steps via
+    `StateMachineGPT.rollout_batch()` (gradient-enabled, unlike the
+    inference-only `rollout()`), and every predicted frame in that
+    self-generated sequence is scored against the real recorded continuation.
+    This is the motion-model analogue of LLM supervised fine-tuning on full
+    generated completions rather than next-token teacher forcing, and it
+    directly optimizes for what `rollout_inference.py` actually does at
+    inference time — closing the train/inference (exposure bias) gap that
+    pure teacher-forced pretraining leaves open.
+
+    Expects a torch Dataset like MultiSMPLXNPZSFTDataset, yielding
+    (seed, target) = ((D,), (n_frames, D)) samples.
+    """
+
+    def __init__(self, config: dict, ckpt_dir: str = "checkpoints", pretrained_checkpoint: str = None):
+        self.config   = config
+        self.ckpt_dir = ckpt_dir
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+
+        self.model = StateMachineGPT(config)
+        self.device = self.model.device
+        self.model.to(self.device)
+
+        if pretrained_checkpoint is not None:
+            # Fine-tune from an existing pretrained checkpoint: load weights
+            # only, not its optimizer state — SFT is a new training phase
+            # with its own optimizer trajectory.
+            self.model.load_safetensors(pretrained_checkpoint, device=self.device, load_optimizer=False)
+            logger.info(f"[SFT] initialized from pretrained checkpoint: {pretrained_checkpoint}")
+
+        self.model.print_param_size()
+
+        self.optimizer = self.model.optimizer
+        self._eps      = 1e-8
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _is_ddp(self) -> bool:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        return isinstance(self.model, DDP)
+
+    def _rank(self) -> int:
+        import torch.distributed as dist
+        return dist.get_rank() if dist.is_initialized() else 0
+
+    def _is_main(self) -> bool:
+        return self._rank() == 0
+
+    def _module(self):
+        return self.model.module if self._is_ddp() else self.model
+
+    def _compute_loss(self, pred_seq: torch.Tensor, target_seq: torch.Tensor) -> torch.Tensor:
+        """
+        MSE loss between the full autoregressively-generated sequence and the
+        real recorded continuation — the SFT analogue of an LLM's next-token
+        cross-entropy averaged over every generated position, not just one.
+
+        pred_seq, target_seq : (B, n_frames, D)
+        """
+        loss = F.mse_loss(pred_seq, target_seq)
+        if not torch.isfinite(loss):
+            raise ValueError(f"Non-finite loss: {loss.item()}")
+        return loss
+
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
+
+    def train(
+        self,
+        train_loader,
+        epochs: int = 10,
+        val_loader=None,
+        log_every: int = 1,
+        best_path: str = None,
+        patience: int = 10,
+        grad_clip_norm: float = 1.0,
+        save_every_epochs: int = None,
+    ) -> dict:
+        """
+        Args:
+            train_loader       : DataLoader yielding (seed, target) batches,
+                                  seed=(B,D), target=(B,n_frames,D) — e.g. from
+                                  MultiSMPLXNPZSFTDataset.
+            epochs             : total training epochs
+            val_loader         : optional validation DataLoader (same format)
+            log_every          : log interval in epochs
+            best_path          : path prefix for best checkpoint (safetensors)
+            patience           : early-stop patience (epochs without improvement)
+            grad_clip_norm     : gradient clipping max norm (0 = disabled) —
+                                  more important here than in SMTrainer, since
+                                  gradients backprop through the whole unrolled
+                                  n_frames-step rollout (similar to BPTT).
+            save_every_epochs  : if set, save a checkpoint every N epochs
+
+        Returns:
+            history dict with 'train_loss' (and 'val_loss' if val_loader given)
+        """
+        history = {"train_loss": []}
+        if val_loader is not None:
+            history["val_loss"] = []
+
+        best_metric = math.inf
+        best_epoch  = 0
+        bad_epochs  = 0
+
+        if best_path is None:
+            best_path = os.path.join(self.ckpt_dir, "best_state_machine_gpt_sft")
+
+        for ep in range(1, epochs + 1):
+
+            # ---- TRAIN ----
+            self.model.train()
+            total, n = 0.0, 0
+
+            for batch in train_loader:
+                seed, target = batch   # seed: (B, D), target: (B, n_frames, D)
+
+                seed   = seed.to(self.device).unsqueeze(1)   # (B, 1, D) — rollout_batch expects (B, T0, D)
+                target = target.to(self.device)
+
+                if not (torch.isfinite(seed).all() and torch.isfinite(target).all()):
+                    continue  # skip NaN/Inf batches
+
+                pred_seq = self.model.rollout_batch(seed, n_steps=target.shape[1])
+                loss     = self._compute_loss(pred_seq, target) * self.config.get("loss_scale", 1.0)
+
+                self.optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if grad_clip_norm and grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_norm)
+                self.optimizer.step()
+
+                total += float(loss.item())
+                n     += 1
+
+            train_loss = total / max(n, 1)
+            history["train_loss"].append(train_loss)
+
+            # ---- VALIDATION ----
+            val_loss = None
+            if val_loader is not None:
+                self.model.eval()
+                vtotal, vn = 0.0, 0
+                with torch.no_grad():
+                    for batch in val_loader:
+                        seed, target = batch
+                        seed   = seed.to(self.device).unsqueeze(1)
+                        target = target.to(self.device)
+                        pred_seq = self.model.rollout_batch(seed, n_steps=target.shape[1])
+                        vtotal  += float(self._compute_loss(pred_seq, target).item())
+                        vn      += 1
+                val_loss = vtotal / max(vn, 1)
+                history["val_loss"].append(val_loss)
+
+            # ---- CHECKPOINT + EARLY STOPPING ----
+            current_metric = val_loss if val_loader is not None else train_loss
+
+            if current_metric < (best_metric - 1e-8):
+                best_metric = current_metric
+                best_epoch  = ep
+                bad_epochs  = 0
+                self._module().save_safetensors(best_path)
+                if self._is_main():
+                    logger.info(f"[ckpt] saved best @ epoch {ep}: metric={best_metric:.6f}")
+            else:
+                bad_epochs += 1
+                if bad_epochs >= patience:
+                    if self._is_main():
+                        logger.info(
+                            f"[early stop] no improvement for {patience} epochs. "
+                            f"best_epoch={best_epoch}, best_metric={best_metric:.6f}"
+                        )
+                    break
+
+            if save_every_epochs and (ep % save_every_epochs) == 0:
+                path = os.path.join(self.ckpt_dir, f"sft_ep_{ep:04d}_state_machine_gpt")
+                self._module().save_safetensors(path)
+
+            # ---- LOG ----
+            if (ep % log_every) == 0 and self._is_main():
+                if val_loader is None:
+                    logger.info(f"[SFT] Epoch {ep}/{epochs} | train_loss={train_loss:.6f}")
+                else:
+                    logger.info(
+                        f"[SFT] Epoch {ep}/{epochs} | "
+                        f"train_loss={train_loss:.6f} | val_loss={val_loss:.6f}"
+                    )
+
+        return history
