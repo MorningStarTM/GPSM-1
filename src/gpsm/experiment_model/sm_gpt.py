@@ -350,6 +350,38 @@ class StateMachineGPT(nn.Module):
 
         return torch.cat(preds, dim=0)   # (n_steps, D)
 
+    def rollout_batch(self, seed: torch.Tensor, n_steps: int) -> torch.Tensor:
+        """
+        Differentiable, batched autoregressive rollout — the training-time
+        counterpart to `rollout()`. `rollout()`/`predict_next()` are
+        `@torch.no_grad()` and call `self.eval()`, so they cannot be used
+        during training: gradients must flow through every step of the
+        model's own predictions for supervised fine-tuning on multi-step
+        generation (see SFTTrainer), not just detached inference.
+
+        Args:
+            seed    : (B, T0, D) — batch of history windows (T0 >= 1)
+            n_steps : number of future frames to generate
+
+        Returns:
+            (B, n_steps, D) — the predicted frames only (seed not included)
+        """
+        if seed.dim() != 3:
+            raise ValueError(f"seed must be (B, T0, D), got {tuple(seed.shape)}")
+
+        window = seed.to(self.device)   # (B, T0, D)
+        k      = self.config["block_size"]
+        preds  = []
+
+        for _ in range(n_steps):
+            ctx        = window[:, -k:, :]        # trim to block_size
+            logits     = self.forward(ctx)         # (B, t, D)
+            next_frame = logits[:, -1:, :]         # (B, 1, D)
+            preds.append(next_frame)
+            window = torch.cat([window, next_frame], dim=1)
+
+        return torch.cat(preds, dim=1)   # (B, n_steps, D)
+
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
