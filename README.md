@@ -253,8 +253,8 @@ python -m src.gpsm.tests.rollout_inference data/12_L_2_stageii.npz \
     --model-folder model/SMPLX_FEMALE.npz --mesh --fps 4
 # -> 12_L_2_stageii_rollout_joints.gif, 12_L_2_stageii_rollout_mesh.gif
 
-python -m src.gpsm.tests.ground_truth_inference data/12_L_2_stageii.npz --n-frames 128 --model-folder model/SMPLX_FEMALE.npz --fps 26
-# -> 12_L_2_stageii_groundtruth_joints.gif, 12_L_2_stageii_groundtruth_mesh.gif
+python -m src.gpsm.tests.ground_truth_inference data/0019_lifting_heavy1_poses.npz --n-frames 128 --model-folder model/SMPLX_FEMALE.npz --fps 26
+# -> 0019_lifting_heavy1_poses_groundtruth_joints.gif, 0019_lifting_heavy1_poses_groundtruth_mesh.gif
 ```
 
 `--start` (default `0`) picks which real frame the ground-truth clip begins at,
