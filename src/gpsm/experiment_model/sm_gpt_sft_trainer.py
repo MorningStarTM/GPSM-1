@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn.functional as F
 from src.gpsm.experiment_model.sm_gpt import StateMachineGPT
+from src.gpsm.experiment_model.distributed import reduce_mean
 from src.gpsm.utils.logger import logger
 
 
@@ -15,10 +16,11 @@ class SFTTrainer:
     model never sees its own predictions during training.
 
     SFTTrainer is the next phase: given a single seed frame, the model must
-    free-run its own predictions forward for `n_frames` steps via
-    `StateMachineGPT.rollout_batch()` (gradient-enabled, unlike the
-    inference-only `rollout()`), and every predicted frame in that
-    self-generated sequence is scored against the real recorded continuation.
+    free-run its own predictions forward for `n_frames` steps (see
+    `_rollout()` below — gradient-enabled and DDP-safe, unlike the
+    inference-only `StateMachineGPT.rollout()`/`rollout_batch()`), and every
+    predicted frame in that self-generated sequence is scored against the
+    real recorded continuation.
     This is the motion-model analogue of LLM supervised fine-tuning on full
     generated completions rather than next-token teacher forcing, and it
     directly optimizes for what `rollout_inference.py` actually does at
@@ -67,6 +69,29 @@ class SFTTrainer:
 
     def _module(self):
         return self.model.module if self._is_ddp() else self.model
+
+    def _rollout(self, seed: torch.Tensor, n_steps: int) -> torch.Tensor:
+        """
+        Same free-running autoregressive loop as StateMachineGPT.rollout_batch,
+        reimplemented here calling `self.model(ctx)` at every step instead of
+        `self.model.rollout_batch(...)`. This matters under DDP: DDP only
+        registers its gradient-all-reduce hooks on its own __call__/forward,
+        not on custom methods reached through `.module`. Calling through
+        `.module` wouldn't even raise an error — it would silently skip
+        gradient synchronization and let every rank's weights drift apart
+        independently. Calling `self.model(ctx)` is correct for both a plain
+        StateMachineGPT and a DDP-wrapped one.
+        """
+        block_size = self._module().config["block_size"]
+        window = seed
+        preds  = []
+        for _ in range(n_steps):
+            ctx        = window[:, -block_size:, :]
+            logits     = self.model(ctx)      # self.model(...), NOT self.model.rollout_batch(...)
+            next_frame = logits[:, -1:, :]
+            preds.append(next_frame)
+            window = torch.cat([window, next_frame], dim=1)
+        return torch.cat(preds, dim=1)
 
     def _compute_loss(self, pred_seq: torch.Tensor, target_seq: torch.Tensor) -> torch.Tensor:
         """
@@ -128,6 +153,11 @@ class SFTTrainer:
 
         for ep in range(1, epochs + 1):
 
+            # Required for correct shuffling with a DistributedSampler — a
+            # no-op if train_loader isn't using one.
+            if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+                train_loader.sampler.set_epoch(ep)
+
             # ---- TRAIN ----
             self.model.train()
             total, n = 0.0, 0
@@ -135,13 +165,13 @@ class SFTTrainer:
             for batch in train_loader:
                 seed, target = batch   # seed: (B, D), target: (B, n_frames, D)
 
-                seed   = seed.to(self.device).unsqueeze(1)   # (B, 1, D) — rollout_batch expects (B, T0, D)
+                seed   = seed.to(self.device).unsqueeze(1)   # (B, 1, D) — _rollout() expects (B, T0, D)
                 target = target.to(self.device)
 
                 if not (torch.isfinite(seed).all() and torch.isfinite(target).all()):
                     continue  # skip NaN/Inf batches
 
-                pred_seq = self.model.rollout_batch(seed, n_steps=target.shape[1])
+                pred_seq = self._rollout(seed, n_steps=target.shape[1])
                 loss     = self._compute_loss(pred_seq, target) * self.config.get("loss_scale", 1.0)
 
                 self.optimizer.zero_grad(set_to_none=True)
@@ -153,7 +183,10 @@ class SFTTrainer:
                 total += float(loss.item())
                 n     += 1
 
-            train_loss = total / max(n, 1)
+            # Sync the local (per-rank shard) average into the true global
+            # average — see reduce_mean()'s docstring for why this is
+            # required for correctness under DDP, not just prettier logs.
+            train_loss = reduce_mean(total / max(n, 1), self.device)
             history["train_loss"].append(train_loss)
 
             # ---- VALIDATION ----
@@ -166,10 +199,10 @@ class SFTTrainer:
                         seed, target = batch
                         seed   = seed.to(self.device).unsqueeze(1)
                         target = target.to(self.device)
-                        pred_seq = self.model.rollout_batch(seed, n_steps=target.shape[1])
+                        pred_seq = self._rollout(seed, n_steps=target.shape[1])
                         vtotal  += float(self._compute_loss(pred_seq, target).item())
                         vn      += 1
-                val_loss = vtotal / max(vn, 1)
+                val_loss = reduce_mean(vtotal / max(vn, 1), self.device)
                 history["val_loss"].append(val_loss)
 
             # ---- CHECKPOINT + EARLY STOPPING ----
@@ -179,8 +212,8 @@ class SFTTrainer:
                 best_metric = current_metric
                 best_epoch  = ep
                 bad_epochs  = 0
-                self._module().save_safetensors(best_path)
-                if self._is_main():
+                if self._is_main():  # avoid every rank writing the same file concurrently
+                    self._module().save_safetensors(best_path)
                     logger.info(f"[ckpt] saved best @ epoch {ep}: metric={best_metric:.6f}")
             else:
                 bad_epochs += 1
@@ -192,7 +225,7 @@ class SFTTrainer:
                         )
                     break
 
-            if save_every_epochs and (ep % save_every_epochs) == 0:
+            if save_every_epochs and (ep % save_every_epochs) == 0 and self._is_main():
                 path = os.path.join(self.ckpt_dir, f"sft_ep_{ep:04d}_state_machine_gpt")
                 self._module().save_safetensors(path)
 
