@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn.functional as F
 from src.gpsm.experiment_model.sm_gpt import StateMachineGPT
+from src.gpsm.experiment_model.distributed import reduce_mean
 from src.gpsm.utils.logger import logger
 
 
@@ -109,6 +110,11 @@ class SMTrainer:
 
         for ep in range(1, epochs + 1):
 
+            # Required for correct shuffling with a DistributedSampler — a
+            # no-op if train_loader isn't using one.
+            if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+                train_loader.sampler.set_epoch(ep)
+
             # ---- TRAIN ----
             self.model.train()
             total, n = 0.0, 0
@@ -136,7 +142,10 @@ class SMTrainer:
                 total += float(loss.item())
                 n     += 1
 
-            train_loss = total / max(n, 1)
+            # Sync the local (per-rank shard) average into the true global
+            # average — see reduce_mean()'s docstring for why this is
+            # required for correctness under DDP, not just prettier logs.
+            train_loss = reduce_mean(total / max(n, 1), self.device)
             history["train_loss"].append(train_loss)
 
             # ---- VALIDATION ----
@@ -152,7 +161,7 @@ class SMTrainer:
                         logits   = self.model(x)
                         vtotal  += float(self._compute_loss(logits, y).item())
                         vn      += 1
-                val_loss = vtotal / max(vn, 1)
+                val_loss = reduce_mean(vtotal / max(vn, 1), self.device)
                 history["val_loss"].append(val_loss)
 
             # ---- CHECKPOINT + EARLY STOPPING ----
@@ -162,8 +171,8 @@ class SMTrainer:
                 best_metric = current_metric
                 best_epoch  = ep
                 bad_epochs  = 0
-                self._module().save_safetensors(best_path)
-                if self._is_main():
+                if self._is_main():  # avoid every rank writing the same file concurrently
+                    self._module().save_safetensors(best_path)
                     logger.info(f"[ckpt] saved best @ epoch {ep}: metric={best_metric:.6f}")
             else:
                 bad_epochs += 1
@@ -175,7 +184,7 @@ class SMTrainer:
                         )
                     break
 
-            if save_every_epochs and (ep % save_every_epochs) == 0:
+            if save_every_epochs and (ep % save_every_epochs) == 0 and self._is_main():
                 path = os.path.join(self.ckpt_dir, f"ep_{ep:04d}_state_machine_gpt")
                 self._module().save_safetensors(path)
 
