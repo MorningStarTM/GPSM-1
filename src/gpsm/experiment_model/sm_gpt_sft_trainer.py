@@ -120,6 +120,7 @@ class SFTTrainer:
         patience: int = 10,
         grad_clip_norm: float = 1.0,
         save_every_epochs: int = None,
+        max_steps_per_epoch: int = None,
     ) -> dict:
         """
         Args:
@@ -136,6 +137,17 @@ class SFTTrainer:
                                   gradients backprop through the whole unrolled
                                   n_frames-step rollout (similar to BPTT).
             save_every_epochs  : if set, save a checkpoint every N epochs
+            max_steps_per_epoch: if set, stop each epoch after this many
+                                  batches. Required under DDP when different
+                                  ranks hold different-sized data shards (e.g.
+                                  different file ranges assigned per GPU) —
+                                  every rank MUST call backward() the same
+                                  number of times per epoch, or the rank(s)
+                                  that run out of batches first leave the
+                                  others hanging on the next gradient
+                                  all-reduce and the whole job deadlocks. Pass
+                                  the cross-rank MINIMUM batch count here (see
+                                  sft_main_ddp.py for how it's computed).
 
         Returns:
             history dict with 'train_loss' (and 'val_loss' if val_loader given)
@@ -162,7 +174,12 @@ class SFTTrainer:
             self.model.train()
             total, n = 0.0, 0
 
-            for batch in train_loader:
+            for step, batch in enumerate(train_loader):
+                # See max_steps_per_epoch's docstring above — every DDP rank
+                # must call backward() the same number of times per epoch.
+                if max_steps_per_epoch is not None and step >= max_steps_per_epoch:
+                    break
+
                 seed, target = batch   # seed: (B, D), target: (B, n_frames, D)
 
                 seed   = seed.to(self.device).unsqueeze(1)   # (B, 1, D) — _rollout() expects (B, T0, D)
