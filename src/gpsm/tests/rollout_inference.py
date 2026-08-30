@@ -142,18 +142,23 @@ def simulate_prediction(
     out_dir_p = Path(out_dir)
     out_dir_p.mkdir(parents=True, exist_ok=True)
     stem = Path(npz_path).stem
+    # Tag outputs with which checkpoint produced them (e.g. "best_sm" vs
+    # "best_sm_sft") so rollouts from different checkpoints on the same npz
+    # don't overwrite each other — lets you compare base vs. SFT side by side.
+    ckpt_tag = Path(checkpoint_path).stem
 
     result = rollout_from_first_frame(npz_path, checkpoint_path, n_steps=n_steps, device=device)
     sequence = result["sequence_denorm"]  # (n_steps+1, D) = poses(width varies by SMPL-X data variant) + trans(3)
 
+    print(f"Checkpoint: {checkpoint_path}")
     print(f"Seed frame + {n_steps} autoregressive predictions "
           f"(sequence shape {sequence.shape})")
     print(f"  predicted value range: "
           f"[{result['predicted_denorm'].min():.4f}, {result['predicted_denorm'].max():.4f}]")
 
     # Always produce a lightweight, model-free sanity plot.
-    plot_pose_curves(sequence, out_dir_p / f"{stem}_rollout_pose.png",
-                      title=f"{stem} — seed + {n_steps}-step rollout")
+    plot_pose_curves(sequence, out_dir_p / f"{stem}_{ckpt_tag}_rollout_pose.png",
+                      title=f"{stem} — seed + {n_steps}-step rollout ({ckpt_tag})")
 
     if model_folder is None:
         print("No --model-folder given — skipping SMPL-X animation "
@@ -230,8 +235,8 @@ def simulate_prediction(
         joints = joints - root
 
     animate_joints(
-        joints, out_dir_p / f"{stem}_rollout_joints.gif", fps=fps,
-        title=f"{stem} — seed + {n_steps}-step rollout (SMPL-X, {resolved_gender})",
+        joints, out_dir_p / f"{stem}_{ckpt_tag}_rollout_joints.gif", fps=fps,
+        title=f"{stem} — seed + {n_steps}-step rollout (SMPL-X, {resolved_gender}, {ckpt_tag})",
     )
 
     if with_mesh:
@@ -239,8 +244,8 @@ def simulate_prediction(
         if not keep_root_motion:
             vertices = vertices - root
         animate_mesh(
-            vertices, body_model.faces, out_dir_p / f"{stem}_rollout_mesh.gif", fps=fps,
-            title=f"{stem} — seed + {n_steps}-step rollout (SMPL-X, {resolved_gender})",
+            vertices, body_model.faces, out_dir_p / f"{stem}_{ckpt_tag}_rollout_mesh.gif", fps=fps,
+            title=f"{stem} — seed + {n_steps}-step rollout (SMPL-X, {resolved_gender}, {ckpt_tag})",
         )
 
 
