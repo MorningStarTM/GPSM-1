@@ -261,6 +261,183 @@ python -m src.gpsm.tests.ground_truth_inference data/0019_lifting_heavy1_poses.n
 in case you want to compare against a rollout seeded from somewhere other than
 frame 0.
 
+## 3D Simulator (SMPL-X live viewer)
+
+`simulator/` is a live 3D viewer for GPSM, built on `pyrender` + `trimesh`. It
+sits outside `src/gpsm` on purpose — it's a visualization/testing tool built
+on top of a trained checkpoint, not part of the model or training pipeline.
+Where the `tests/` scripts above bake a rollout into a pre-rendered GIF, the
+simulator opens a real window with a game-engine-editor-style camera (see
+`fly_camera.py` below) and plays the posed SMPL-X body back live (or drives
+it frame-by-frame from `StateMachineGPT.rollout()` directly).
+
+```
+simulator/
+├── smplx_scene.py     pyrender scene build/update (ground plane, camera, lighting, body mesh)
+├── fly_camera.py         game-engine-style fly camera (WASD + mouse-look) — GameViewer(pyrender.Viewer)
+├── model_runner.py     checkpoint/npz -> denormalized rollout -> SMPL-X forward kinematics -> vertices
+├── live_viewer.py       interactive GameViewer window (requires a display)
+└── offscreen_test.py     headless render-to-GIF/PNG self-test (no display required)
+```
+
+Requires `pyrender`, `PyOpenGL`, and `trimesh` in addition to the core/tests
+dependencies below (`pip install pyrender PyOpenGL PyOpenGL_accelerate`).
+
+Note (applies to every command below): a checkpoint's `state_dim` must match
+the `.npz` file's feature width (`poses` width + `trans`) — see the
+`dataset.py` section above (`strict_dim`) and `simulate_smplx.py`'s
+`POSES_LAYOUTS`. `checkpoints/best_sm` was trained on `state_dim=159` (the
+156-dim hands-only pose layout, e.g. `data/0019_lifting_heavy1_poses.npz`,
+`data/0013_knocking1_poses.npz`, `data/0029_jumping2_poses.npz`); the
+`12_*_stageii.npz` / `SW_B_*_stageii.npz` files use the 165-dim full
+face+hands layout (`D=168`) and will raise a clear "Feature width mismatch"
+error against that checkpoint — pass `--ground-truth` (no model involved) to
+view those instead.
+
+### `live_viewer.py` — interactive 3D window (main entry point)
+
+Opens a real OpenGL window (via `pyglet`) and plays a motion sequence back
+live as a posed SMPL-X body, using a **game-engine-editor-style fly camera**
+(`fly_camera.py`, below) — like Unity's Scene view or Unreal's editor
+viewport: the camera moves and looks around a fixed world; the ground and
+body never rotate. This is what you run to actually *watch* the model. Two
+modes, chosen by whether `--ground-truth` is passed:
+
+- **Model rollout (default)** — seeds `StateMachineGPT` with the first frame
+  of `npz_path`, autoregressively predicts `--n-steps` future frames via
+  `rollout()`, and plays that back.
+- **Ground truth** (`--ground-truth`) — plays back the real recorded frames
+  from `npz_path` instead, no model/checkpoint involved. Useful as a sanity
+  check or to compare against a rollout by eye.
+
+Controls once the window is open: **left-drag** to look around (camera
+rotates in place, world stays fixed), **W/A/S/D** to move forward/left/
+backward/right, **Space**/**Left-Ctrl** to move up/down, **scroll** to adjust
+move speed, **q**/**ESC** to quit. Other pyrender hotkeys still work too
+(`f` fullscreen, `l` cycle lighting, `z` reset view, ...). Add `--move-speed`
+to change the starting speed (default `3.0` m/s; scroll in-viewer to adjust
+live).
+
+```
+# model rollout — the main use case
+python -m simulator.live_viewer data/0019_lifting_heavy1_poses.npz \
+    --checkpoint checkpoints/best_sm --model-folder model/SMPLX_FEMALE.npz --n-steps 90
+
+# ground-truth playback (no --checkpoint needed)
+python -m simulator.live_viewer data/12_L_2_stageii.npz \
+    --model-folder model/SMPLX_FEMALE.npz --ground-truth --n-steps 150
+```
+
+Key flags: `--n-steps` (rollout: frames to predict; ground-truth: frames to
+play), `--start` (ground-truth only — starting frame index), `--fps`
+(playback speed, default 24), `--device` (`cpu`/`cuda`, default auto),
+`--gender`/`--num-betas`/`--use-pca`/`--no-flat-hand-mean` (SMPL-X body model
+options), `--keep-root-motion` (show true world-space translation instead of
+recentring on the pelvis every frame), `--no-loop` (play once instead of
+looping), `--auto-close-seconds N` (close the window automatically after N
+seconds — mainly for scripted/automated smoke tests).
+
+### `fly_camera.py` — game-engine-style camera (library, not run directly)
+
+Also not run directly — this is what actually answers "make it move like a
+game engine viewport, not orbit the whole scene." `pyrender.Viewer`'s default
+camera is a *trackball*: dragging the mouse rotates the entire scene (ground
+included) around a pivot point. `fly_camera.py` replaces that with:
+
+- **`FlyCamera`** — a plain yaw/pitch camera (position + heading), Z-up to
+  match `smplx_scene.py`'s world convention. `look(dyaw, dpitch)` turns the
+  camera in place; `move(forward, right, up)` translates it along its own
+  current facing; `to_matrix()` produces the camera-to-world pose pyrender
+  needs. None of this ever touches the scene itself.
+- **`GameViewer(pyrender.Viewer)`** — a subclass that swaps pyrender's
+  trackball mouse/keyboard handling for `FlyCamera`: left-drag looks around,
+  WASD moves, Space/Left-Ctrl move up/down, scroll adjusts move speed, ESC
+  quits. Every other pyrender hotkey (fullscreen, lighting, wireframe, ...)
+  still works unchanged — only the letter keys that collided with WASD were
+  overridden. `live_viewer.py` uses `GameViewer` in place of
+  `pyrender.Viewer`; nothing else about it changed.
+
+Only worth importing directly if you're building another interactive tool on
+top of the same camera; normal usage is through `live_viewer.py` above.
+
+### `offscreen_test.py` — headless render check (no window)
+
+Runs the exact same rendering pipeline as `live_viewer.py` but through
+`pyrender.OffscreenRenderer` instead of a live window, so it works with no
+display at all, and saves the result as a GIF + one mid-sequence PNG instead
+of playing it back. It also actively checks every rendered frame is finite
+and non-blank and raises immediately if not. Use this to sanity-check a
+checkpoint, a new `.npz` file, or a code change to `smplx_scene.py` /
+`model_runner.py`, without needing to sit and watch a window.
+
+```
+# model rollout, headless
+python -m simulator.offscreen_test data/0019_lifting_heavy1_poses.npz \
+    --checkpoint checkpoints/best_sm --model-folder model/SMPLX_FEMALE.npz --n-steps 20
+
+# ground-truth, headless
+python -m simulator.offscreen_test data/12_L_2_stageii.npz \
+    --model-folder model/SMPLX_FEMALE.npz --ground-truth --n-steps 40
+```
+
+Same `--n-steps`/`--start`/`--fps`/`--device`/`--gender`/`--num-betas`/
+`--use-pca`/`--no-flat-hand-mean`/`--keep-root-motion`/`--ground-truth` flags
+as `live_viewer.py` above, plus `--out-dir` (default `simulator/output/`,
+already gitignored) for where the GIF/PNG get written.
+
+### `model_runner.py` — checkpoint/npz → posed vertices (library, not run directly)
+
+Not a script you run from the command line — it's the shared logic both
+`live_viewer.py` and `offscreen_test.py` call into. Deliberately reuses the
+already-validated rollout/denormalization/SMPL-X logic from
+`src/gpsm/tests/rollout_inference.py` and `src/gpsm/tests/simulate_smplx.py`
+instead of reimplementing it, and wraps the result in a small `MotionSequence`
+container (`.vertices` `(T, V, 3)`, `.joints` `(T, J, 3)`, `.faces` `(F, 3)`,
+`.fps`). Exposes two functions:
+
+- `generate_rollout_sequence(npz_path, checkpoint_path, model_folder, n_steps, ...)`
+  — seed + autoregressive model rollout → posed vertices.
+- `generate_ground_truth_sequence(npz_path, model_folder, n_frames, start, ...)`
+  — real recorded frames → posed vertices, no model.
+
+Useful directly if you're scripting something new (e.g. a notebook, a batch
+comparison over many checkpoints) rather than using either CLI:
+
+```python
+from simulator.model_runner import generate_rollout_sequence
+
+seq = generate_rollout_sequence(
+    "data/0019_lifting_heavy1_poses.npz",
+    checkpoint_path="checkpoints/best_sm",
+    model_folder="model/SMPLX_FEMALE.npz",
+    n_steps=90,
+)
+print(seq.n_frames, seq.vertices.shape, seq.faces.shape)
+```
+
+### `smplx_scene.py` — pyrender scene helpers (library, not run directly)
+
+Also not run directly — the low-level pyrender building blocks both the
+live and offscreen paths share, kept separate from `model_runner.py` so the
+"get posed vertices" logic and the "turn vertices into a pyrender scene"
+logic don't get tangled together:
+
+- `build_scene(vertices0, faces, viewport_size=(960, 720))` — builds a fresh
+  `pyrender.Scene` for frame 0: a ground plane sized to the body, the posed
+  body mesh, a camera framing it, and two directional lights. Returns
+  `(scene, body_node, camera_node)`. Built around **world +Z as "up"**,
+  verified empirically against this repo's actual SMPL-X output (not
+  assumed) — see the module docstring if adapting this for a different SMPL
+  variant or dataset convention.
+- `update_body_mesh(scene, body_node, vertices, faces)` — swaps the body
+  node's mesh for a new frame's pose (pyrender can't mutate a node's mesh
+  buffers in place, so this removes and re-adds the node each call). Returns
+  the new node — callers must keep using the returned node, not the old one.
+
+Only worth importing directly if you're building a different renderer/viewer
+on top of the same scene layout; normal usage is through `live_viewer.py` /
+`offscreen_test.py` above.
+
 ## Quickstart
 
 ```python

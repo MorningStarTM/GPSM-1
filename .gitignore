@@ -210,3 +210,5 @@ __marimo__/
 /checkpoints/
 /model/
 /src/gpsm/tests/output/
+/doc/
+/simulator/output/
