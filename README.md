@@ -438,6 +438,40 @@ Only worth importing directly if you're building a different renderer/viewer
 on top of the same scene layout; normal usage is through `live_viewer.py` /
 `offscreen_test.py` above.
 
+## Control extraction (prototype)
+
+To steer the model (press left, turn left) it needs a control input, but the
+mocap files contain none. `src/gpsm/control/` derives one from the recording
+itself: for every frame, where the character's root goes over the next
+0.1 / 0.25 / 0.5 s and how much it turns, expressed relative to the
+character's own position and heading (so it does not depend on where or which
+way the clip was recorded). Works on both `.npz` (AMASS, SMPL-H and SMPL-X)
+and raw `.c3d` marker files — for `.c3d` the root is estimated from the four
+waist markers (`LFWT`, `RFWT`, `LBWT`, `RBWT`).
+
+```
+src/gpsm/control/
+├── root_trajectory.py    .npz / .c3d -> RootTrajectory (ground position + heading, metres, Z-up)
+├── control_features.py   RootTrajectory -> per-frame control vector (14 numbers) + valid mask
+└── inspect_control.py    CLI: summary table, plots, and saved control arrays for a folder
+```
+
+```
+# summary table + a plot and a control .npz per file, into src/gpsm/control/output/
+python -m src.gpsm.control.inspect_control data
+
+# a single file
+python -m src.gpsm.control.inspect_control "data/B9 -  Walk turn left 90.c3d"
+
+pytest tests/test_control.py -v
+```
+
+Reading `.c3d` needs `pip install c3d` (the existing `dataset.py` loader uses
+`ezc3d`, which has no wheel for every platform). On the two labelled clips the
+extracted turn while walking is +87 deg for "Walk turn left 90" and +142 deg
+for "Walk turn left 135". This is a prototype: it produces the control signal
+but does not yet feed it to a model.
+
 ## Quickstart
 
 ```python
