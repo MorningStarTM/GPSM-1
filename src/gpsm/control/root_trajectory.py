@@ -167,6 +167,36 @@ def _fill_gaps(values: np.ndarray) -> np.ndarray:
 # .npz  (AMASS / SMPL-H / SMPL-X)
 # ---------------------------------------------------------------------------
 
+def root_trajectory_from_canonical(
+    trans: np.ndarray, global_orient: np.ndarray, fps: float, source: str = ""
+) -> RootTrajectory:
+    """Build a root trajectory from canonical SMPL-X fields.
+
+    This is the one entry point that matters once data has been through
+    MotionPrep: every source format (parameters, markers, BVH) comes out of
+    unification with a real ``global_orient``, so heading is read the same
+    way for all of them, with no per-format special cases.
+
+    Args:
+        trans:         ``(T, 3)`` root translation, metres.
+        global_orient: ``(T, 3)`` root rotation, axis-angle.
+        fps:           Frame rate.
+        source:        Name to carry along for messages/plots.
+
+    Returns:
+        The :class:`RootTrajectory`.
+    """
+    rotation_matrices = _axis_angle_to_matrix(np.asarray(global_orient, dtype=np.float64))
+    left_in_world = rotation_matrices @ np.array([1.0, 0.0, 0.0])  # SMPL body-space left = +X
+    heading = heading_from_left_vector(left_in_world[:, :2])
+    return RootTrajectory(
+        position=np.asarray(trans, dtype=np.float64)[:, :2],
+        heading=heading,
+        fps=float(fps),
+        source=source,
+    )
+
+
 def root_trajectory_from_npz(path: str) -> RootTrajectory:
     """Read the root trajectory from an AMASS-style ``.npz`` file.
 
@@ -201,13 +231,11 @@ def root_trajectory_from_npz(path: str) -> RootTrajectory:
 
         fps = float(data[fps_key])
         root_rotation = data["poses"][:, :3].astype(np.float64)
-        position = data["trans"][:, :2].astype(np.float64)
+        trans = data["trans"].astype(np.float64)
 
-    rotation_matrices = _axis_angle_to_matrix(root_rotation)
-    left_in_world = rotation_matrices @ np.array([1.0, 0.0, 0.0])  # SMPL body-space left = +X
-    heading = heading_from_left_vector(left_in_world[:, :2])
-
-    return RootTrajectory(position=position, heading=heading, fps=fps, source=Path(path).name)
+    # The first 3 numbers of `poses` are exactly the canonical
+    # `global_orient`, so this is the canonical path with a reader in front.
+    return root_trajectory_from_canonical(trans, root_rotation, fps, source=Path(path).name)
 
 
 # ---------------------------------------------------------------------------
