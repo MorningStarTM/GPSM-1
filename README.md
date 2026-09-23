@@ -438,6 +438,51 @@ Only worth importing directly if you're building a different renderer/viewer
 on top of the same scene layout; normal usage is through `live_viewer.py` /
 `offscreen_test.py` above.
 
+## MotionPrep — the data pipeline
+
+`src/gpsm/motionprep/` turns a folder of mixed raw mocap into training-ready
+`(pose, control)` pairs. Two stages, each cached separately, because Stage 1 is
+slow and Stage 2 is not — retuning the control signal must never force
+re-running the body fitting. See [doc/MotionPrep.docx](doc/MotionPrep.docx) for
+the full design.
+
+```
+src/gpsm/motionprep/
+├── formats.py            which kind of mocap file is this?
+├── manifest.py           per-file record of what happened (incl. skips), crash-safe
+├── unify.py               Stage 1: any format -> canonical SMPL-X pose @ one fps, quality-filtered
+└── extract_control.py      Stage 2: pose -> 14-number control signal, index-aligned
+```
+
+```bash
+# Stage 1 — unify, resample to 30fps, drop bad fits
+python -m src.gpsm.motionprep.unify data --out processed/unified
+
+# Stage 2 — add the control signal (cheap; safe to re-run on its own)
+python -m src.gpsm.motionprep.extract_control processed/unified --out processed/with_control
+
+pytest tests/test_motionprep.py -v
+```
+
+Each stage writes a `manifest.csv` recording every input file and what became of
+it. Re-running skips work already finished (`ok`/`skipped`) but retries anything
+that `failed`, so an interrupted run — or one stopped by a Kaggle session
+timeout — can just be started again.
+
+**Two source paths, with very different costs.** Parameter files (`.npz` holding
+SMPL/SMPL-H/SMPL-X poses) are *converted*: exact, ~0.1s per clip. Point files
+(`.c3d` markers, `.bvh` skeletons) have no body model behind them, so one is
+*fitted* by optimization: approximate, and roughly **1.3 s per frame on CPU**.
+That cost is why point files are resampled down to the target fps *before*
+fitting rather than after — fitting a 120fps clip then keeping every 4th frame
+would cost 4× the same result.
+
+Output of Stage 2, per clip: the canonical pose fields (`trans`,
+`global_orient`, `body_pose`, both hands, `part_mask`, `betas`), plus
+`control` `(T, 14)` and `control_valid` `(T,)`. `control[t]` sits at the **same
+index** as `pose[t]` and describes where the body goes *from* frame `t`;
+training predicts `pose[t+1]` from `(pose[t], control[t])`.
+
 ## Control extraction (prototype)
 
 To steer the model (press left, turn left) it needs a control input, but the
