@@ -1,5 +1,6 @@
 import os
 import zipfile
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -8,9 +9,14 @@ from src.gpsm.smplx.adapters.markers import build_matched_layout, load_c3d
 from src.gpsm.smplx.fitting.solver import fit_observation
 from src.gpsm.smplx.schema import Observation
 
-SAMPLE_C3D = "E:/github_clone/GPSM-1/data/01_01.c3d"
+# Searched recursively, and relative to the repo, so that reorganising
+# data/ into per-format subfolders (as has already happened once) does not
+# silently turn these real-data tests into skips.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_c3d_samples = sorted((_REPO_ROOT / "data").rglob("*.c3d"))
+SAMPLE_C3D = str(_c3d_samples[0]) if _c3d_samples else ""
 requires_sample_c3d = pytest.mark.skipif(
-    not os.path.isfile(SAMPLE_C3D), reason=f"Sample C3D not found at {SAMPLE_C3D}"
+    not SAMPLE_C3D, reason="no .c3d sample found under data/"
 )
 
 # The exact file reported to crash `load_c3d` — ships inside a zip archive
@@ -32,7 +38,7 @@ def _read_analog_bug_sample() -> bytes:
 def test_load_real_c3d_file():
     cap = load_c3d(SAMPLE_C3D)
     assert cap.points_m.ndim == 3 and cap.points_m.shape[2] == 3
-    assert cap.fps == 120.0
+    assert cap.fps > 0
     assert cap.up_axis in ("y", "z")
     assert not cap.up_axis_guessed  # head/foot markers present -> confident guess
     assert not np.isnan(cap.points_m).any()
@@ -125,3 +131,27 @@ def test_fit_reported_file_end_to_end(smplx_body):
     motion, quality = fit_observation(obs, smplx_body, layout)
     assert not np.isnan(motion.to_array()).any()
     assert quality.verdict in ("GOOD", "DEGRADED", "REJECT")
+
+
+@requires_sample_c3d
+def test_occluded_markers_are_reported_not_silently_zeroed():
+    """C3D stores an occluded marker as literally (0, 0, 0) with a negative
+    residual. Those samples must be reported as unobserved via `valid`, so
+    callers can pass them to the solver as zero-confidence.
+
+    Regression test for a measured bug: feeding them through as if they were
+    real measurements put phantom markers at the world origin and dragged a
+    real clip's fit to 639mm joint RMSE (REJECT); masking them out brought
+    the same clip to 66mm.
+    """
+    cap = load_c3d(SAMPLE_C3D)
+
+    assert cap.valid.shape == cap.points_m.shape[:2]
+    assert cap.valid.dtype == bool
+    assert cap.valid.any(), "a usable file cannot be entirely occluded"
+
+    # Wherever a sample is marked invalid, it must be the (0,0,0) sentinel —
+    # i.e. `valid` really is tracking occlusion, not something unrelated.
+    if not cap.valid.all():
+        occluded = cap.points_m[~cap.valid]
+        assert np.allclose(occluded, 0.0)

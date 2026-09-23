@@ -155,9 +155,16 @@ def test_last_frames_are_marked_invalid():
 # ---------------------------------------------------------------------------
 
 def _first_match(pattern):
-    matches = sorted(DATA_DIR.glob(pattern))
+    """Find a sample file anywhere under data/.
+
+    Searched recursively (``rglob``) on purpose: data/ has been organised
+    into per-format subfolders (data/c3d/, data/npz/) at least once already,
+    and a flat glob silently turned these real-data tests into skips when
+    that happened — coverage quietly disappearing is worse than a failure.
+    """
+    matches = sorted(DATA_DIR.rglob(pattern))
     if not matches:
-        pytest.skip(f"no file matching data/{pattern}")
+        pytest.skip(f"no file matching {pattern} under data/")
     return str(matches[0])
 
 
@@ -201,7 +208,7 @@ def test_no_impossible_spins_in_marker_files():
     one file (B17) showed a 99th-percentile turn rate of ~3000 deg/s — about
     8 full spins per second. No person does that, so any value that high means
     the heading estimate is broken, not that the character spun."""
-    files = sorted(DATA_DIR.glob("*.c3d"))
+    files = sorted(DATA_DIR.rglob("*.c3d"))
     if not files:
         pytest.skip("no .c3d files in data/")
     for path in files:

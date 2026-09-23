@@ -1,5 +1,6 @@
 import glob
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -10,11 +11,14 @@ from src.gpsm.smplx.adapters.params import (
 )
 from src.gpsm.smplx.schema import CANONICAL_DIM
 
-REAL_DATA_DIR = "E:/github_clone/GPSM-1/data/"
-_real_files = sorted(glob.glob(os.path.join(REAL_DATA_DIR, "*.npz"))) if os.path.isdir(REAL_DATA_DIR) else []
+# Searched recursively, and relative to the repo, so that reorganising
+# data/ into per-format subfolders (as has already happened once) does not
+# silently turn these real-data tests into skips.
+REAL_DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+_real_files = sorted(str(p) for p in REAL_DATA_DIR.rglob("*.npz"))
 
 requires_real_data = pytest.mark.skipif(
-    not _real_files, reason=f"Real sample data not found at {REAL_DATA_DIR}"
+    not _real_files, reason=f"no .npz sample data found under {REAL_DATA_DIR}"
 )
 
 
