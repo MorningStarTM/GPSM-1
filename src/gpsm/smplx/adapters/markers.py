@@ -84,13 +84,25 @@ class LenientC3DReader:
             unit = "mm"
         return {"mm": 0.001, "cm": 0.01, "m": 1.0}.get(unit, 0.001)
 
-    def read_points(self) -> np.ndarray:
-        """Returns (T, K, 3) marker positions, in the file's native units
-        (NOT yet converted to meters — see `units_to_meters`)."""
-        frames = []
+    def read_points(self) -> "tuple[np.ndarray, np.ndarray]":
+        """Returns ((T, K, 3) marker positions, (T, K) validity mask).
+
+        Positions are in the file's native units (NOT yet converted to
+        meters — see `units_to_meters`).
+
+        The validity mask comes from each sample's *residual* (the 4th
+        column): C3D stores an occluded marker as literally (0, 0, 0) with
+        a negative residual, not as a gap. Those samples must be reported
+        as unobserved, never as a real measurement — a phantom marker
+        sitting at the world origin drags a fit badly (measured on a real
+        file: feeding them in as real points produced a 639mm joint RMSE
+        and a REJECT verdict, versus a normal fit once masked out).
+        """
+        positions, valid = [], []
         for _frame_no, points, _analog in self._reader.read_frames():
-            frames.append(points[:, :3])
-        return np.stack(frames, axis=0)
+            positions.append(points[:, :3])
+            valid.append(points[:, 3] >= 0)
+        return np.stack(positions, axis=0), np.stack(valid, axis=0)
 
 
 @dataclass
@@ -100,6 +112,10 @@ class RawMarkerCapture:
     fps: float
     up_axis: str
     up_axis_guessed: bool
+    valid: np.ndarray      # (T, K) bool — False where the marker was occluded
+                            # (stored in the file as (0,0,0) + negative residual).
+                            # Pass this to the solver as `conf`; never treat a
+                            # False entry's position as a real measurement.
 
 
 def load_c3d(file_like: Union[str, BinaryIO]) -> RawMarkerCapture:
@@ -114,12 +130,14 @@ def load_c3d(file_like: Union[str, BinaryIO]) -> RawMarkerCapture:
     try:
         reader = LenientC3DReader(handle)
         labels = reader.labels
-        raw_points = reader.read_points()
+        raw_points, valid = reader.read_points()
         points_m = raw_points * reader.units_to_meters()
-        up_axis, guessed = guess_up_axis(points_m, labels)
+        # Guess the up-axis from observed samples only — occluded markers
+        # sit at the origin and would skew the guess.
+        up_axis, guessed = guess_up_axis(np.where(valid[..., None], points_m, np.nan), labels)
         return RawMarkerCapture(
             points_m=points_m, labels=labels, fps=reader.point_rate,
-            up_axis=up_axis, up_axis_guessed=guessed,
+            up_axis=up_axis, up_axis_guessed=guessed, valid=valid,
         )
     finally:
         if owns_handle:

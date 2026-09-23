@@ -6,6 +6,8 @@ Z-up convention differs from HumanML3D's Y-up.
 """
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
 
@@ -51,6 +53,10 @@ def guess_up_axis(points_m: np.ndarray, point_names, head_keywords=("head", "hd"
     x-up result (rare) falls back to z with `guessed=True` so the caller
     can surface that reduced confidence.
 
+    Samples may be NaN to mark "not observed here" (e.g. an occluded C3D
+    marker); those are ignored rather than averaged in. A point that is
+    never observed at all, or an all-NaN input, falls back to z/guessed.
+
     Returns (up_axis: str, guessed: bool).
     """
     upper = [str(n).upper() for n in point_names]
@@ -58,7 +64,13 @@ def guess_up_axis(points_m: np.ndarray, point_names, head_keywords=("head", "hd"
     foot_idx = [i for i, n in enumerate(upper) if any(k.upper() in n for k in foot_keywords)]
     if not head_idx or not foot_idx:
         return "z", True
-    diff = points_m[:, head_idx, :].mean(axis=(0, 1)) - points_m[:, foot_idx, :].mean(axis=(0, 1))
+    with warnings.catch_warnings():  # an all-NaN slice is handled just below
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        head_mean = np.nanmean(points_m[:, head_idx, :], axis=(0, 1))
+        foot_mean = np.nanmean(points_m[:, foot_idx, :], axis=(0, 1))
+    diff = head_mean - foot_mean
+    if not np.isfinite(diff).all():
+        return "z", True
     axis = int(np.argmax(diff))
     if axis == 2:
         return "z", False
