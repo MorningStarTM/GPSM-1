@@ -107,13 +107,30 @@ class GameViewer(pyrender.Viewer):
     MOVE_SPEED_MAX = 30.0
     LOOK_SENSITIVITY = 0.0035  # radians of yaw/pitch per pixel of drag
 
-    def __init__(self, *args, move_speed: float = 3.0, **kwargs):
+    def __init__(self, *args, move_speed: float = 3.0, external_camera: bool = False, **kwargs):
+        # external_camera=True hands the camera to the caller: this class
+        # stops consuming W/A/S/D and stops writing the camera pose, so
+        # something else (a third-person follow camera, say) can own both.
+        # The mouse-look and movement handlers below simply go quiet.
+        self._external_camera = external_camera
         self._fly_cam: Optional[FlyCamera] = None
         self._move_speed = float(move_speed)
         self._last_frame_time = time.time()
         self._keys = pyglet.window.key.KeyStateHandler()
         super().__init__(*args, **kwargs)
         self.push_handlers(self._keys)
+
+    @property
+    def held_keys(self):
+        """Which keys are currently held down.
+
+        Index it with pyglet key codes, e.g. ``viewer.held_keys[key.UP]``.
+        Exposed so something outside the camera (a character being driven by
+        the player) can read the keyboard without reaching into internals.
+        Keys the camera itself uses (W/A/S/D, Space, Ctrl) appear here too,
+        so a caller should pick keys that do not collide with those.
+        """
+        return self._keys
 
     # ------------------------------------------------------------------
     # Mouse: look only, never orbits/pans/zooms the world
@@ -123,6 +140,8 @@ class GameViewer(pyrender.Viewer):
         pass  # swallow — no trackball state machine to arm
 
     def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
+        if self._external_camera:
+            return
         if buttons & pyglet.window.mouse.LEFT and self._fly_cam is not None:
             self._fly_cam.look(-dx * self.LOOK_SENSITIVITY, dy * self.LOOK_SENSITIVITY)
 
@@ -164,6 +183,11 @@ class GameViewer(pyrender.Viewer):
         dt = max(now - self._last_frame_time, 0.0)
         self._last_frame_time = now
 
+        if self._external_camera:
+            # The caller owns the camera; fall through to the rendering half
+            # below without touching camera_node.matrix.
+            return self._render_scene()
+
         if self._fly_cam is None:
             # First frame — camera_node.matrix was set by pyrender's own
             # _reset_view()/_compute_initial_camera_pose() before any draw
@@ -179,11 +203,16 @@ class GameViewer(pyrender.Viewer):
         if forward_amt or right_amt or up_amt:
             self._fly_cam.move(forward_amt, right_amt, up_amt)
 
-        # ---- from here down mirrors pyrender.Viewer._render exactly,
-        # except the camera pose comes from the fly camera, not the
-        # trackball. Kept in sync with pyrender==0.1.45. ----
-        scene = self.scene
         self._camera_node.matrix = self._fly_cam.to_matrix()
+        return self._render_scene()
+
+    def _render_scene(self):
+        """The rendering half, shared by both camera modes.
+
+        Mirrors pyrender.Viewer._render from the lighting setup onward;
+        kept in sync with pyrender==0.1.45.
+        """
+        scene = self.scene
 
         vli = self.viewer_flags['lighting_intensity']
         if self.viewer_flags['use_raymond_lighting']:

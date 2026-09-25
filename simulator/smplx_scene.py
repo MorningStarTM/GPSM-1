@@ -64,6 +64,65 @@ def make_ground_plane(center_xy: np.ndarray, z: float, size: float = 4.0) -> pyr
     return pyrender.Mesh.from_trimesh(tm, smooth=False)
 
 
+def make_checkerboard_ground(size: float = 60.0, tile: float = 1.0, z: float = 0.0) -> pyrender.Mesh:
+    """A large checkerboard floor on the world XY plane (Z-up).
+
+    A single flat-coloured plane makes movement impossible to see — a
+    character walking across it looks stationary, because nothing in the
+    image changes. The alternating tiles give the eye something to move
+    against, which is the whole point when the thing being judged is
+    whether the character goes where it was told.
+
+    Args:
+        size: Total width of the floor, metres.
+        tile: Width of one square, metres.
+        z:    Floor height.
+    """
+    steps = int(size / tile)
+    start = -size / 2.0
+    vertices, faces, colors = [], [], []
+
+    for ix in range(steps):
+        for iy in range(steps):
+            x0, y0 = start + ix * tile, start + iy * tile
+            x1, y1 = x0 + tile, y0 + tile
+            base = len(vertices)
+            vertices += [[x0, y0, z], [x1, y0, z], [x1, y1, z], [x0, y1, z]]
+            faces += [[base, base + 1, base + 2], [base, base + 2, base + 3]]
+            shade = 0.62 if (ix + iy) % 2 == 0 else 0.48
+            colors += [[shade, shade, shade + 0.04, 1.0]] * 4
+
+    mesh = trimesh.Trimesh(
+        vertices=np.array(vertices, dtype=np.float32),
+        faces=np.array(faces, dtype=np.int64),
+        vertex_colors=(np.array(colors) * 255).astype(np.uint8),
+        process=False,
+    )
+    return pyrender.Mesh.from_trimesh(mesh, smooth=False)
+
+
+def follow_camera_pose(target: np.ndarray, distance: float = 4.5, height: float = 2.2,
+                        behind: np.ndarray = np.array([1.0, -1.0, 0.0])) -> np.ndarray:
+    """Camera pose that keeps ``target`` in view from a fixed offset.
+
+    Needed because the character travels: a static camera loses it within a
+    second or two, and then there is nothing to judge.
+
+    Args:
+        target:   ``(3,)`` world position to look at (the character's root).
+        distance: How far away to sit, metres.
+        height:   How far above the target, metres.
+        behind:   Horizontal direction to sit in, relative to the target.
+    """
+    direction = behind[:2] / (np.linalg.norm(behind[:2]) + 1e-8)
+    eye = np.array([
+        target[0] + direction[0] * distance,
+        target[1] + direction[1] * distance,
+        target[2] + height,
+    ])
+    return look_at(eye, target)
+
+
 def body_mesh_from_vertices(vertices: np.ndarray, faces: np.ndarray) -> pyrender.Mesh:
     tm = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     tm.visual.vertex_colors = np.tile((BODY_COLOR * 255).astype(np.uint8), (vertices.shape[0], 1))
@@ -74,6 +133,7 @@ def build_scene(
     vertices0: np.ndarray,
     faces: np.ndarray,
     viewport_size: Tuple[int, int] = (960, 720),
+    with_ground: bool = True,
 ):
     """
     Builds a scene containing a ground plane sized to the body, the posed
@@ -84,6 +144,10 @@ def build_scene(
         vertices0     : (V, 3) first-frame body vertices.
         faces         : (F, 3) SMPL-X mesh topology (constant across frames).
         viewport_size : (width, height) used only to set the camera aspect ratio.
+        with_ground   : Add the small body-sized ground patch. Set False when
+                        the caller supplies its own floor (e.g. the large
+                        checkerboard the play harness uses) — two overlapping
+                        floors z-fight and look like a rendering fault.
 
     Returns:
         (scene, body_node, camera_node)
@@ -101,7 +165,8 @@ def build_scene(
     radius = max(float(np.linalg.norm(hi - lo)) / 2.0, 0.5)
 
     ground_z = float(lo[2])
-    scene.add(make_ground_plane(center_xy=center[:2], z=ground_z, size=max(radius * 6.0, 4.0)))
+    if with_ground:
+        scene.add(make_ground_plane(center_xy=center[:2], z=ground_z, size=max(radius * 6.0, 4.0)))
 
     body_mesh = body_mesh_from_vertices(vertices0, faces)
     body_node = scene.add(body_mesh)
