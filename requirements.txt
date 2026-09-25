@@ -1,0 +1,44 @@
+# GPSM dependencies.
+#
+# Grouped by what you are actually doing, because the groups differ a lot:
+# running MotionPrep on parameter files needs almost nothing, while the
+# simulator needs a GPU/display stack that will not work on Kaggle at all.
+#
+# On Kaggle, install with:
+#     !pip install -q -r requirements.txt
+#
+# Kaggle images already ship numpy, scipy, torch, matplotlib and pyyaml, so
+# that install is usually a no-op for the core group and only fetches smplx,
+# safetensors and loguru.
+
+# --- Core: MotionPrep (both stages) on parameter files (.npz) -------------
+# This is all you need for the Kaggle data-preparation run. No torch, no body
+# model, no system libraries.
+numpy>=1.24
+scipy>=1.10
+
+# --- Training: MotionMamba ------------------------------------------------
+# Install the torch build that matches your CUDA version; on Kaggle torch is
+# preinstalled, so leave the pinned line alone and let pip skip it.
+torch>=2.0
+safetensors>=0.4
+loguru>=0.7
+PyYAML>=6.0
+
+# --- Fitting: MotionPrep on marker/skeleton files (.c3d, .bvh) ------------
+# Only needed for the slow Tier-1 path, which also requires the SMPL-X body
+# model files (downloaded separately from smpl-x.is.tue.mpg.de).
+smplx>=0.1.28
+
+# --- Simulator and plotting (local desktop only) --------------------------
+# pyrender/pyglet need an OpenGL context, so these do NOT work in a Kaggle
+# notebook. Skip this group there.
+pyrender>=0.1.45
+pyglet<2.0            # pyrender 0.1.x is incompatible with pyglet 2
+trimesh>=4.0
+imageio>=2.31
+matplotlib>=3.7
+
+# --- Development ----------------------------------------------------------
+pytest>=8.0
+python-docx>=1.1      # builds the files in doc/
