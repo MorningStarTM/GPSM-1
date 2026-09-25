@@ -166,6 +166,15 @@ def login_to_amass(email: str, password: str):
             f"AMASS_EMAIL / AMASS_PASSWORD secrets."
         )
     print("Logged in to AMASS.")
+
+    # download.is.tue.mpg.de is a different host from amass.is.tue.mpg.de.
+    # A captured DevTools request confirmed the browser sends this same
+    # PHPSESSID there, but `requests` follows cookie-domain scoping strictly
+    # and will not forward a cookie set for one host to another on its own
+    # -- so it is copied across explicitly rather than assumed.
+    phpsessid = session.cookies.get("PHPSESSID", domain="amass.is.tue.mpg.de")
+    if phpsessid:
+        session.cookies.set("PHPSESSID", phpsessid, domain="download.is.tue.mpg.de")
     return session
 
 
@@ -191,20 +200,30 @@ def download_kit_archive(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading from: {url}" + (" (POST)" if form_data else " (GET)"))
+    # A captured DevTools request showed the browser sending Referer:
+    # https://amass.is.tue.mpg.de/ -- these gated download endpoints
+    # commonly check it as a weak anti-hotlinking measure, so match it
+    # rather than let the request look like it came from nowhere.
+    headers = {"Referer": "https://amass.is.tue.mpg.de/"}
     requester = (
-        (lambda **kw: session.post(url, data=form_data, **kw))
+        (lambda **kw: session.post(url, data=form_data, headers=headers, **kw))
         if form_data
-        else (lambda **kw: session.get(url, **kw))
+        else (lambda **kw: session.get(url, headers=headers, **kw))
     )
     with requester(stream=True, allow_redirects=True) as response:
         response.raise_for_status()
         content_type = response.headers.get("Content-Type", "")
         if "text/html" in content_type:
+            import re
+            snippet = re.sub(r"<[^>]+>", " ", response.text)
+            snippet = re.sub(r"\s+", " ", snippet).strip()[:300]
             raise RuntimeError(
                 f"Got HTML back instead of an archive (Content-Type: "
-                f"{content_type}). This almost always means the session "
-                f"was not authenticated for this file, or the link expired "
-                f"-- re-copy KIT_DOWNLOAD_URL from a fresh logged-in page."
+                f"{content_type}). This host (download.is.tue.mpg.de) is "
+                f"separate from the one you log in to (amass.is.tue.mpg.de) "
+                f"-- if the PHPSESSID cookie / Referer header this script "
+                f"sends ever stop being enough, that link may have changed. "
+                f"What the page actually said: {snippet!r}"
             )
 
         total = int(response.headers.get("Content-Length", 0))
