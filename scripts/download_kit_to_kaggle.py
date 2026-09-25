@@ -24,11 +24,15 @@ replace the constant -- the rest of the script does not change.
 SETUP ON KAGGLE
 ----------------
 1. Turn Internet ON for the notebook (Settings > Internet).
-2. Add three notebook Secrets (Add-ons > Secrets):
+2. Add four notebook Secrets (Add-ons > Secrets) -- NOT hardcoded here, and
+   not the same thing as a downloaded kaggle.json file:
      AMASS_EMAIL, AMASS_PASSWORD   your login at amass.is.tue.mpg.de
-     KAGGLE_KEY                    your Kaggle API key (Account > Create New
-                                    API Token; KAGGLE_USERNAME is filled in
-                                    automatically from your Kaggle account)
+     KAGGLE_USERNAME                your Kaggle username
+     KAGGLE_KEY                     the "key" field from Account > Create
+                                     New API Token's downloaded kaggle.json
+   If you ever paste a real password or API key into a chat or a terminal,
+   treat it as burned: regenerate the Kaggle token and change the AMASS
+   password rather than reuse them.
 3. KIT_DOWNLOAD_URL is already filled in below; only change
    KAGGLE_DATASET_SLUG if you want a different dataset name.
 4. Run: !python scripts/download_kit_to_kaggle.py
@@ -217,7 +221,9 @@ def extract_archive(archive_path: Path, out_dir: Path) -> Path:
     return out_dir
 
 
-def publish_to_kaggle(source_dir: Path, dataset_slug: str, kaggle_key: str) -> None:
+def publish_to_kaggle(
+    source_dir: Path, dataset_slug: str, kaggle_username: str, kaggle_key: str
+) -> None:
     """Push `source_dir` as a private Kaggle dataset via the Kaggle CLI.
 
     The `kaggle` package reads credentials from the environment at import
@@ -225,11 +231,17 @@ def publish_to_kaggle(source_dir: Path, dataset_slug: str, kaggle_key: str) -> N
     or invoked -- hence setting os.environ here rather than writing
     ~/.kaggle/kaggle.json (either works; this avoids a file with a
     credential sitting on disk).
+
+    `kaggle_username` is passed in explicitly rather than guessed from a
+    Kaggle-internal environment variable, since which env var (if any)
+    reliably carries it could not be confirmed -- a wrong guess would fail
+    silently by publishing to the wrong dataset id, which is worse than
+    asking for one more secret.
     """
-    os.environ["KAGGLE_USERNAME"] = os.environ.get("KAGGLE_USERNAME", "")
+    os.environ["KAGGLE_USERNAME"] = kaggle_username
     os.environ["KAGGLE_KEY"] = kaggle_key
 
-    username = os.environ.get("KAGGLE_USERNAME") or _current_kaggle_username()
+    username = kaggle_username
     metadata = {
         "title": "AMASS KIT (SMPL-X, neutral)",
         "id": f"{username}/{dataset_slug}",
@@ -263,24 +275,16 @@ def publish_to_kaggle(source_dir: Path, dataset_slug: str, kaggle_key: str) -> N
     print(f'  prepare("/kaggle/input/{dataset_slug}")')
 
 
-def _current_kaggle_username() -> str:
-    try:
-        from kaggle_secrets import UserSecretsClient  # noqa: F401
-        # Kaggle sets this automatically inside a running kernel.
-        return os.environ["KAGGLE_USER_NAME"]
-    except Exception:
-        return input("Your Kaggle username: ")
-
-
 def main() -> None:
     email = _secret("AMASS_EMAIL", "AMASS_EMAIL")
     password = _secret("AMASS_PASSWORD", "AMASS_PASSWORD")
+    kaggle_username = _secret("KAGGLE_USERNAME", "KAGGLE_USERNAME")
     kaggle_key = _secret("KAGGLE_KEY", "KAGGLE_KEY")
 
     session = login_to_amass(email, password)
     download_kit_archive(session, KIT_DOWNLOAD_URL, ARCHIVE_PATH, KIT_DOWNLOAD_FORM_DATA)
     extract_archive(ARCHIVE_PATH, EXTRACT_DIR)
-    publish_to_kaggle(EXTRACT_DIR, KAGGLE_DATASET_SLUG, kaggle_key)
+    publish_to_kaggle(EXTRACT_DIR, KAGGLE_DATASET_SLUG, kaggle_username, kaggle_key)
 
 
 if __name__ == "__main__":
