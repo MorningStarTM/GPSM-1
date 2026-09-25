@@ -58,6 +58,7 @@ only as reading material while writing our own version. See
 from __future__ import annotations
 
 import json
+from typing import Optional
 import math
 import os
 
@@ -106,6 +107,11 @@ def _validate_config(config: dict) -> dict:
 
     config = dict(config)
     config["d_inner"] = config["expand"] * config["n_embd"]
+    # Optional: how many control numbers accompany each pose frame. 0 means
+    # "no control", i.e. the plain next-pose model this class started as, so
+    # older configs and checkpoints keep working untouched.
+    config.setdefault("control_dim", 0)
+    config["input_dim"] = config["state_dim"] + config["control_dim"]
     return config
 
 
@@ -524,7 +530,9 @@ class MotionMamba(nn.Module):
         config = _validate_config(dict(config))
         self.config = config
 
-        self.prev_pos_embedding = nn.Linear(config["state_dim"], config["n_embd"])
+        # Input is the pose plus (optionally) the control that goes with it;
+        # the output stays pose-only, since control is supplied, never predicted.
+        self.prev_pos_embedding = nn.Linear(config["input_dim"], config["n_embd"])
         self.blocks = nn.Sequential(*[ResidualBlock(config) for _ in range(config["n_layers"])])
         self.ln_f = RMSNorm(config["n_embd"])
         self.next_pos_head = nn.Linear(config["n_embd"], config["state_dim"])
@@ -562,20 +570,25 @@ class MotionMamba(nn.Module):
         """Predict a pose at every input timestep.
 
         Args:
-            obs     : ``(B, T, D)`` or ``(T, D)`` — window of past poses.
+            obs     : ``(B, T, D)`` or ``(T, D)`` — window of past frames,
+                      each ``concat(pose, control)`` when the model is
+                      configured with control (``D == input_dim``), or just
+                      the pose when ``control_dim`` is 0.
             targets : Unused — kept only so this method has the same
                       signature as ``StateMachineGPT.forward()``, which
                       also ignores it.
 
         Returns:
             ``logits`` with the same leading dims as ``obs`` and last dim
-            ``state_dim``.
+            ``state_dim`` — pose only. The model never predicts control:
+            control is an input describing what the motion should do next,
+            supplied by the player at run time.
 
         Raises:
             TypeError: If ``obs`` is not a tensor.
             ValueError: If ``obs`` has the wrong number of dimensions, an
                 empty sequence, or a feature width that does not match
-                ``config['state_dim']``.
+                ``config['input_dim']``.
         """
         if not torch.is_tensor(obs):
             raise TypeError(f"`obs` must be a torch.Tensor, got {type(obs)}")
@@ -592,10 +605,11 @@ class MotionMamba(nn.Module):
 
         if T <= 0:
             raise ValueError(f"Sequence length T must be > 0, got T={T}")
-        if D != self.config["state_dim"]:
+        if D != self.config["input_dim"]:
             raise ValueError(
-                f"Input feature dim D={D} does not match config['state_dim']="
-                f"{self.config['state_dim']}."
+                f"Input feature dim D={D} does not match config['input_dim']="
+                f"{self.config['input_dim']} (state_dim {self.config['state_dim']} "
+                f"+ control_dim {self.config['control_dim']})."
             )
 
         x = self.prev_pos_embedding(obs)  # (B, T, n_embd) — no positional embedding needed
@@ -649,39 +663,82 @@ class MotionMamba(nn.Module):
         return logits.squeeze(0) if squeeze_B else logits
 
     @torch.no_grad()
-    def rollout(self, seed_frames: torch.Tensor, n_steps: int) -> torch.Tensor:
-        """Autoregressively generate ``n_steps`` future poses.
+    def rollout(
+        self,
+        seed_frames: torch.Tensor,
+        n_steps: Optional[int] = None,
+        control: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Autoregressively generate future poses.
 
-        Scaffold note (Task 1.1): this calls :meth:`forward` on the whole
-        growing window every step, exactly like
-        ``StateMachineGPT.rollout()`` — the "naive" version. Task 3.3
-        replaces the *internals* of this method with a ``step()``-based
-        version that reuses a small carried state instead of reprocessing
-        every earlier frame, which is what actually makes an SSM's
-        inference fast. The signature (and, given the same trained model,
-        the numerical output) will not change.
+        With control configured, this is no longer something the model can
+        do on its own: each new frame needs to be told where the motion is
+        meant to go, exactly as a game would read the player's stick once
+        per frame. So ``control`` supplies one control vector per generated
+        frame, and its length decides how many frames come out.
+
+        Without control (``control_dim == 0``) the old behaviour applies and
+        ``n_steps`` is used instead — the model free-runs from the seed.
+
+        Note on cost: this calls :meth:`forward` on the whole growing window
+        every step. That is the straightforward version, not the fast one —
+        an SSM can carry a small fixed-size state between steps instead of
+        reprocessing the history, which is the real reason to use one for
+        real-time generation. Swapping the internals for that does not
+        change this signature or its output.
 
         Args:
-            seed_frames : ``(T, D)`` — initial context window (``T >= 1``).
-            n_steps     : Number of new frames to generate.
+            seed_frames : ``(T, input_dim)`` — the starting window, each row
+                          ``concat(pose, control)`` when control is in use.
+            n_steps     : How many frames to generate. Only for the
+                          no-control case; ignored when ``control`` is given.
+            control     : ``(n_steps, control_dim)`` — the control for each
+                          frame being generated. ``control[i]`` belongs to
+                          the *newly generated* frame ``i``, and is what
+                          steers the frame after it.
 
         Returns:
-            ``(n_steps, D)`` — the predicted future frames only (the seed
-            is not included).
+            ``(n_steps, state_dim)`` — the predicted poses only (no control,
+            and not including the seed).
         """
         self.eval()
         if seed_frames.dim() != 2:
             raise ValueError(f"seed_frames must be (T, D), got {tuple(seed_frames.shape)}")
 
+        control_dim = self.config["control_dim"]
+        if control_dim > 0:
+            if control is None:
+                raise ValueError(
+                    "This model was configured with control_dim="
+                    f"{control_dim}, so rollout() needs a `control` array "
+                    "(one row per frame to generate) — it cannot invent the "
+                    "motion's intent by itself."
+                )
+            control = control.to(self.device)
+            if control.dim() != 2 or control.shape[1] != control_dim:
+                raise ValueError(
+                    f"control must be (n_steps, {control_dim}), got {tuple(control.shape)}"
+                )
+            n_steps = control.shape[0]
+        elif n_steps is None:
+            raise ValueError("Without control, rollout() needs n_steps.")
+
         window = seed_frames.to(self.device)
-        predicted_frames = []
+        predicted_poses = []
 
-        for _ in range(n_steps):
-            next_frame = self.predict_next(window)  # (D,)
-            predicted_frames.append(next_frame.unsqueeze(0))  # (1, D)
-            window = torch.cat([window, next_frame.unsqueeze(0)], dim=0)
+        for step in range(n_steps):
+            next_pose = self.predict_next(window)  # (state_dim,)
+            predicted_poses.append(next_pose.unsqueeze(0))
 
-        return torch.cat(predicted_frames, dim=0)  # (n_steps, D)
+            # Extend the window with the new frame. With control, that frame
+            # is the predicted pose plus the control belonging to it.
+            if control_dim > 0:
+                next_row = torch.cat([next_pose, control[step]], dim=0)
+            else:
+                next_row = next_pose
+            window = torch.cat([window, next_row.unsqueeze(0)], dim=0)
+
+        return torch.cat(predicted_poses, dim=0)  # (n_steps, state_dim)
 
     def rollout_batch(self, seed: torch.Tensor, n_steps: int) -> torch.Tensor:
         """Differentiable, batched autoregressive rollout (for training).
