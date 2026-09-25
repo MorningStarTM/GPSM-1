@@ -252,3 +252,68 @@ def test_pipeline_preserves_the_motion_it_started_with(tmp_path):
     )
 
     assert prepped_turn == pytest.approx(raw_turn, abs=5.0)
+
+
+# ---------------------------------------------------------------------------
+# The one-call Kaggle runner
+# ---------------------------------------------------------------------------
+
+def test_prepare_runs_both_stages_and_returns_the_training_folder(tmp_path):
+    """The notebook calls one function and trains on what it returns, so the
+    returned path must actually hold Stage 2 output, not Stage 1's."""
+    from src.gpsm.motionprep.kaggle import prepare
+
+    out = prepare(str(DATA_DIR / "npz"), out_dir=str(tmp_path), limit=2)
+
+    assert Path(out) == tmp_path / "with_control"
+    clips = sorted(Path(out).glob("*.npz"))
+    assert clips, "Stage 2 produced nothing"
+
+    clip = np.load(clips[0], allow_pickle=True)
+    assert "control" in clip and "control_valid" in clip
+    assert clip["control"].shape[0] == clip["trans"].shape[0], (
+        "control must be index-aligned with pose"
+    )
+
+
+def test_prepare_resumes_instead_of_redoing_work(tmp_path):
+    """Kaggle sessions time out, so the run has to be restartable: a second
+    call must not redo finished files."""
+    from src.gpsm.motionprep.kaggle import prepare
+
+    prepare(str(DATA_DIR / "npz"), out_dir=str(tmp_path))
+    first = sorted(p.name for p in (tmp_path / "with_control").glob("*.npz"))
+    stamps = {p.name: p.stat().st_mtime_ns for p in (tmp_path / "with_control").glob("*.npz")}
+
+    prepare(str(DATA_DIR / "npz"), out_dir=str(tmp_path))
+    second = sorted(p.name for p in (tmp_path / "with_control").glob("*.npz"))
+
+    assert first == second, "a complete re-run must not add or lose clips"
+    after = {p.name: p.stat().st_mtime_ns for p in (tmp_path / "with_control").glob("*.npz")}
+    assert after == stamps, "finished clips must not be rewritten on a re-run"
+
+
+def test_limit_processes_the_next_files_not_the_same_ones(tmp_path):
+    """`limit` caps the work *remaining*, not the total. That is what makes it
+    usable on Kaggle: call it again after a timeout and it chips away at the
+    rest instead of grinding over what is already done."""
+    from src.gpsm.motionprep.kaggle import prepare
+
+    prepare(str(DATA_DIR / "npz"), out_dir=str(tmp_path), limit=2)
+    first = sorted(p.name for p in (tmp_path / "with_control").glob("*.npz"))
+
+    prepare(str(DATA_DIR / "npz"), out_dir=str(tmp_path), limit=2)
+    second = sorted(p.name for p in (tmp_path / "with_control").glob("*.npz"))
+
+    assert len(first) == 2
+    assert len(second) == 4, "a second call should advance, not repeat"
+    assert set(first) < set(second), "and it must keep what was already done"
+
+
+def test_summarize_survives_a_run_that_never_started(tmp_path, capsys):
+    """Called on its own after a crash, it should report that there is
+    nothing yet rather than raise."""
+    from src.gpsm.motionprep.kaggle import summarize
+
+    summarize(str(tmp_path))
+    assert "no manifest yet" in capsys.readouterr().out
