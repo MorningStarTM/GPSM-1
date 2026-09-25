@@ -30,12 +30,18 @@ SETUP ON KAGGLE
      KAGGLE_USERNAME                your Kaggle username
      KAGGLE_KEY                     the "key" field from Account > Create
                                      New API Token's downloaded kaggle.json
+   Saving a secret to your account is not enough -- each one also has to be
+   toggled ON for *this* notebook in that same Add-ons > Secrets panel.
    If you ever paste a real password or API key into a chat or a terminal,
    treat it as burned: regenerate the Kaggle token and change the AMASS
    password rather than reuse them.
 3. KIT_DOWNLOAD_URL is already filled in below; only change
    KAGGLE_DATASET_SLUG if you want a different dataset name.
-4. Run: !python scripts/download_kit_to_kaggle.py
+4. Run this in a normal code cell -- NOT `!python scripts/...` (a shell
+   subprocess can't reliably reach the Secrets connection, and can't be
+   typed into if it falls back to asking):
+     from scripts.download_kit_to_kaggle import main
+     main()
 
 Result: a private Kaggle dataset at <your-username>/<KAGGLE_DATASET_SLUG>,
 ready for:
@@ -86,13 +92,33 @@ AMASS_LOGIN_URL = "https://amass.is.tue.mpg.de/login.php"
 
 
 def _secret(name: str, env_fallback: str = "") -> str:
-    """Read a Kaggle notebook Secret, falling back to an env var, then to an
-    interactive prompt (so this also works outside Kaggle for testing)."""
+    """Read a Kaggle notebook Secret, falling back to an env var, then (only
+    off Kaggle, e.g. local testing) to an interactive prompt.
+
+    On Kaggle a failure here almost always means one of two things, and the
+    error says so rather than silently dropping into a prompt that a
+    `!python script.py` subprocess cannot actually be typed into:
+      1. the secret exists in your account but was never toggled ON for
+         *this* notebook (Add-ons > Secrets lists your saved secrets with a
+         per-notebook attach switch -- having one saved is not enough), or
+      2. the script was run as a shell subprocess (`!python ...`) instead
+         of in-kernel, and the Secrets connection is not reliably available
+         to a child subprocess.
+    """
     try:
         from kaggle_secrets import UserSecretsClient
         return UserSecretsClient().get_secret(name)
-    except Exception:
-        pass
+    except Exception as error:
+        if "KAGGLE_KERNEL_RUN_TYPE" in os.environ:  # i.e. this is Kaggle
+            raise RuntimeError(
+                f"Could not read secret '{name}' ({error}). On Kaggle:\n"
+                f"  1. Add-ons > Secrets -> make sure '{name}' is attached "
+                f"(toggled ON) for THIS notebook, not just saved to your "
+                f"account.\n"
+                f"  2. Run this in a normal code cell, not `!python ...`:\n"
+                f"       from scripts.download_kit_to_kaggle import main\n"
+                f"       main()"
+            ) from error
     if env_fallback and os.environ.get(env_fallback):
         return os.environ[env_fallback]
     import getpass
@@ -118,11 +144,26 @@ def login_to_amass(email: str, password: str):
     # A failed login re-renders the same login form; a successful one takes
     # you somewhere else. This is a soft check, not a guarantee, but it turns
     # a wrong password into a clear error here instead of a corrupt download
-    # later.
+    # later. The site also renders its own reason (e.g. "Username / Password
+    # incorrect") in an `alert-danger` div -- surface that verbatim instead
+    # of a generic guess, since it is the actual answer, not a guess at one.
     if 'name="password"' in response.text and "login" in response.url.lower():
+        import re
+        site_reason = re.search(
+            r"alert-danger[^>]*>(?:\s*<button[^>]*>.*?</button>\s*)?(.*?)</div>",
+            response.text, re.S,
+        )
+        detail = (
+            re.sub(r"<[^>]+>", "", site_reason.group(1)).strip()
+            if site_reason else "no error message was rendered by the site"
+        )
         raise RuntimeError(
-            "AMASS login looks like it failed (still on the login page). "
-            "Check AMASS_EMAIL / AMASS_PASSWORD."
+            f"AMASS login failed. The site says: {detail!r}. If you rotated "
+            f"AMASS_PASSWORD recently (recommended after typing it in a "
+            f"chat/terminal), make sure the Kaggle Secret was updated to "
+            f"match -- a stale secret is the most common cause of this. "
+            f"Also check for a trailing space or newline pasted into the "
+            f"AMASS_EMAIL / AMASS_PASSWORD secrets."
         )
     print("Logged in to AMASS.")
     return session
