@@ -262,6 +262,19 @@ def find_input_files(input_dir: Path) -> List[Path]:
     return sorted(p for p in input_dir.rglob("*") if p.is_file() and p.suffix.lower() in known)
 
 
+def _needs_fitting(path) -> bool:
+    """Whether this file has to have a body fitted to it (markers/skeleton).
+
+    Unreadable files answer False: they will fail on their own in the loop
+    and get a manifest row, which is more useful than failing the whole run
+    before it starts.
+    """
+    try:
+        return detect_source_format(str(path)) in NEEDS_FITTING
+    except UnknownFormatError:
+        return False
+
+
 def run(
     input_dir: str,
     out_dir: str,
@@ -297,9 +310,19 @@ def run(
     if not todo:
         return
 
-    # The body model is only needed for point-based sources, and loading it
-    # is slow, so it is loaded once and only if something actually needs it.
+    # The body model is only needed for point-based sources, so it is loaded
+    # only if something in this batch actually needs it — but it is loaded
+    # *up front*, not lazily inside the loop. A missing model is a problem
+    # with the run, not with one file: loading it lazily meant the per-file
+    # try/except swallowed the same error once per file, so a batch of a few
+    # thousand markers printed a few thousand identical failures instead of
+    # stopping on the first.
     body = None
+    if any(_needs_fitting(path) for path in todo):
+        from src.gpsm.smplx.fitting.body import SMPLXBody
+        print("Loading SMPL-X body model (needed for marker/skeleton fitting)...")
+        body = SMPLXBody()
+
     counts = {"ok": 0, "skipped": 0, "failed": 0}
 
     with ManifestWriter(manifest_path, MANIFEST_COLUMNS) as manifest:
@@ -310,11 +333,6 @@ def run(
             try:
                 source_format = detect_source_format(str(path))
                 row["source_format"] = source_format
-
-                if source_format in NEEDS_FITTING and body is None:
-                    from src.gpsm.smplx.fitting.body import SMPLXBody
-                    print("  loading SMPL-X body model (needed for marker/skeleton fitting)...")
-                    body = SMPLXBody()
 
                 if source_format == NPZ_PARAMS:
                     motion = unify_params(str(path), target_fps)
