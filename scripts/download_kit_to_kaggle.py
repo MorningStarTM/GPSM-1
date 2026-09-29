@@ -290,7 +290,14 @@ def publish_to_kaggle(
 
     username = kaggle_username
     metadata = {
-        "title": "AMASS (SMPL-X, neutral)",  # not "... KIT ..." anymore -- this now holds several sub-datasets
+        # The title used to be a fixed string ("AMASS (SMPL-X, neutral)"),
+        # and Kaggle rejected a publish with "title already in use by a
+        # dataset" even though the slug/id below was fine -- titles are
+        # apparently their own uniqueness check, separate from the slug.
+        # Using the slug itself as the title ties them together, so a
+        # title collision cannot happen without a slug collision too (which
+        # the "already exists" handling below already deals with).
+        "title": dataset_slug,
         "id": f"{username}/{dataset_slug}",
         "licenses": [{"name": "other"}],  # AMASS license, not CC0
     }
@@ -302,8 +309,16 @@ def publish_to_kaggle(
         capture_output=True, text=True,
     )
     print(create.stdout)
-    if create.returncode != 0:
-        if "already exists" in (create.stdout + create.stderr).lower():
+    # The installed `kaggle` CLI (2.0.2, flagged outdated by its own
+    # warning) has been observed returning exit code 0 even when the
+    # request was rejected -- "Dataset creation error: ..." printed to
+    # stdout with returncode 0. So an error is also checked for in the text
+    # itself, not just the exit code, or a rejected publish would print
+    # "Done" and look successful.
+    failed = create.returncode != 0 or "error" in create.stdout.lower()
+    if failed:
+        already_exists = "already exists" in (create.stdout + create.stderr).lower()
+        if already_exists:
             print("Dataset already exists -- pushing a new version instead.")
             version = subprocess.run(
                 ["kaggle", "datasets", "version", "-p", str(source_dir),
@@ -311,27 +326,31 @@ def publish_to_kaggle(
                 capture_output=True, text=True,
             )
             print(version.stdout)
-            if version.returncode != 0:
+            version_failed = version.returncode != 0 or "error" in version.stdout.lower()
+            if version_failed:
                 print(version.stderr, file=sys.stderr)
                 raise RuntimeError("Kaggle dataset version push failed.")
         else:
             print(create.stderr, file=sys.stderr)
-            raise RuntimeError("Kaggle dataset create failed.")
+            raise RuntimeError("Kaggle dataset create failed -- see the message above.")
 
     print(f"\nDone. Use it in later notebooks with:")
     print(f'  prepare("/kaggle/input/{dataset_slug}")')
 
 
-def main(display_name: str, url: str) -> None:
-    """Download ONE AMASS sub-dataset and publish it under the AMASS Kaggle
-    dataset. Only `display_name`/`url` are fetched -- nothing else is
-    re-downloaded.
+def main(display_name: str, url: str, kaggle_dataset_slug: str = KAGGLE_DATASET_SLUG) -> None:
+    """Download ONE AMASS sub-dataset and publish it under a Kaggle dataset.
+    Only `display_name`/`url` are fetched -- nothing else is re-downloaded.
 
     Args:
         display_name: Becomes that sub-dataset's subfolder name in the
             published Kaggle dataset (e.g. "ACCAD").
         url: The exact URL captured from DevTools for that dataset's
             "SMPL-X N" button (see the module docstring for how).
+        kaggle_dataset_slug: Which Kaggle dataset this is published under
+            (<your-username>/<this>). Defaults to KAGGLE_DATASET_SLUG, but
+            pass a different one to publish somewhere else -- e.g. if a
+            title/slug on your account is already taken.
     """
     email = _secret("AMASS_EMAIL", "AMASS_EMAIL")
     password = _secret("AMASS_PASSWORD", "AMASS_PASSWORD")
@@ -345,7 +364,7 @@ def main(display_name: str, url: str) -> None:
     download_dataset_archive(session, url, archive_path, DOWNLOAD_FORM_DATA)
     extract_archive(archive_path, out_dir)
 
-    publish_to_kaggle(EXTRACT_ROOT, KAGGLE_DATASET_SLUG, kaggle_username, kaggle_key)
+    publish_to_kaggle(EXTRACT_ROOT, kaggle_dataset_slug, kaggle_username, kaggle_key)
 
 
 if __name__ == "__main__":
