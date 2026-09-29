@@ -1,25 +1,34 @@
-"""Download AMASS KIT (SMPL-X, neutral) and re-publish it as a Kaggle dataset.
+"""Download several AMASS sub-datasets (SMPL-X, neutral) and publish them
+all as ONE Kaggle dataset, one subfolder per sub-dataset -- so "KIT" and
+"ACCAD" and whatever comes next all live under one Kaggle dataset (e.g.
+amass-kit-smplx-neutral), not as separate Kaggle datasets each.
 
-Meant to be run once, inside a Kaggle notebook, so the KIT motions live as a
-Kaggle dataset that ``src/gpsm/motionprep/kaggle.py``'s ``prepare()`` can then
-point at in every later notebook, without re-downloading from AMASS each time.
+Meant to be run once (or re-run to add more sub-datasets later), inside a
+Kaggle notebook, so the motions live as a single Kaggle dataset that
+``src/gpsm/motionprep/kaggle.py``'s ``prepare()`` can point at in every
+later notebook, without re-downloading from AMASS each time.
 
-WHERE KIT_DOWNLOAD_URL BELOW CAME FROM
+HOW TO GET EACH DATASET'S DOWNLOAD URL
 ----------------------------------------
-The download buttons on that page are not plain <a href> links (right-click
--> "Copy link address" finds nothing), so it was captured from DevTools
-instead: Network tab -> "Keep log" on -> click the KIT row's "SMPL-X N"
-button -> right-click the resulting request -> Copy -> Copy as cURL. That
-showed a plain GET to download.is.tue.mpg.de with the file path baked into
-the URL as a query parameter, authenticated purely by a session cookie --
-which is why login_to_amass() below still matters: it establishes that same
-kind of session itself, with your own credentials, rather than reusing
-anyone's copied-from-a-browser cookie (those expire, and are not something
-to keep lying around in a script anyway).
+The download buttons on the AMASS page are not plain <a href> links
+(right-click -> "Copy link address" finds nothing). Capture the real
+request from DevTools instead, once per dataset you want:
+    1. Log in at https://amass.is.tue.mpg.de/download.php
+    2. DevTools (F12) -> Network tab -> "Keep log" on -> clear the log
+    3. Click that dataset's row's "SMPL-X N" button
+    4. Right-click the request that appears -> Copy -> Copy as cURL
+    5. Take just the URL out of that curl command (the one starting
+       https://download.is.tue.mpg.de/download.php?...) and add it to
+       AMASS_DATASETS below.
+This is deliberately not automated by guessing a folder-name pattern --
+an earlier version of this script did that, and about half the guessed
+names were unconfirmed. A pasted URL you have actually seen work in a
+browser is worth more than a guess with a "likely" label on it.
 
-If AMASS ever restructures this page and KIT_DOWNLOAD_URL stops working,
-repeat the DevTools capture above for whatever dataset/gender you need and
-replace the constant -- the rest of the script does not change.
+A wrong or expired URL is not a silent failure: `download_dataset_archive`
+refuses to accept an HTML error page pretending to be an archive, so a bad
+entry shows up as a clear, per-dataset error rather than corrupt data --
+`main()` continues past one dataset's failure so it does not block the rest.
 
 SETUP ON KAGGLE
 ----------------
@@ -35,16 +44,22 @@ SETUP ON KAGGLE
    If you ever paste a real password or API key into a chat or a terminal,
    treat it as burned: regenerate the Kaggle token and change the AMASS
    password rather than reuse them.
-3. KIT_DOWNLOAD_URL is already filled in below; only change
-   KAGGLE_DATASET_SLUG if you want a different dataset name.
+3. AMASS_DATASETS below maps a display name (becomes the subfolder in the
+   published dataset) to the URL captured for it. Add entries as you
+   capture more; keep entries for anything already published, or a version
+   push may drop it (see the comment on AMASS_DATASETS). Only change
+   KAGGLE_DATASET_SLUG if you want this to become a different Kaggle
+   dataset than your existing one.
 4. Run this in a normal code cell -- NOT `!python scripts/...` (a shell
    subprocess can't reliably reach the Secrets connection, and can't be
    typed into if it falls back to asking):
      from scripts.download_kit_to_kaggle import main
      main()
+   To add one more dataset without editing this file, pass it directly:
+     main(extra_datasets={"BMLmovi": "https://download.is.tue.mpg.de/..."})
 
 Result: a private Kaggle dataset at <your-username>/<KAGGLE_DATASET_SLUG>,
-ready for:
+with one subfolder per successfully-downloaded sub-dataset, ready for:
     from src.gpsm.motionprep.kaggle import prepare
     prepare("/kaggle/input/<KAGGLE_DATASET_SLUG>")
 """
@@ -62,29 +77,37 @@ from pathlib import Path
 # CONFIG -- fill these in before running
 # =============================================================================
 
-#: Captured from DevTools (Network tab -> "Copy as cURL") on the KIT row's
-#: "SMPL-X N" button: a plain GET, auth carried entirely by the PHPSESSID
-#: cookie -- which is exactly what login_to_amass() below obtains itself,
-#: so no form data is needed (this script does not reuse your browser's
-#: session/cookie; it logs in fresh with your AMASS_EMAIL/AMASS_PASSWORD).
-#: sfile confirms this is MoSh++'s own neutral-gender SMPL-X fit of KIT --
-#: exactly the "AMASS instead of refitting c3d ourselves" data this script
-#: exists to fetch.
-KIT_DOWNLOAD_URL = (
-    "https://download.is.tue.mpg.de/download.php"
-    "?domain=amass&resume=1"
-    "&sfile=amass_per_dataset/smplx/neutral/mosh_results/KIT.tar.bz2"
-)
-KIT_DOWNLOAD_FORM_DATA: dict = {}
+#: display_name -> the exact URL captured from DevTools for that dataset's
+#: "SMPL-X N" button (see the module docstring for how). display_name also
+#: becomes that dataset's subfolder name in the published Kaggle dataset.
+#:
+#: Every run rebuilds EXTRACT_ROOT from whatever is listed here and pushes
+#: it as the new Kaggle dataset version -- so a sub-dataset already
+#: downloaded and published still has to stay listed here, or a version
+#: push risks dropping it (Kaggle's version-push semantics for a full
+#: folder replace were not confirmed either way, so the safe assumption is
+#: "replace, not merge").
+AMASS_DATASETS = {
+    "KIT": (
+        "https://download.is.tue.mpg.de/download.php"
+        "?domain=amass&resume=1"
+        "&sfile=amass_per_dataset/smplx/neutral/mosh_results/KIT.tar.bz2"
+    ),
+    "ACCAD": "",  # paste ACCAD's captured URL here (see the module docstring)
+}
+
+DOWNLOAD_FORM_DATA: dict = {}  # every captured request so far has been a plain GET, no form body
 
 #: The Kaggle dataset this becomes: <your-username>/<this-slug>. Lowercase,
-#: hyphens only.
+#: hyphens only. Keep this the same as your existing AMASS KIT dataset's
+#: slug if the goal is to add more sub-datasets to it, not create a new one.
 KAGGLE_DATASET_SLUG = "amass-kit-smplx-neutral"
 
-#: Where things are written inside the notebook.
-WORK_DIR = Path("/kaggle/working/kit_download")
-ARCHIVE_PATH = WORK_DIR / "kit_smplx_n.archive"
-EXTRACT_DIR = WORK_DIR / "kit_smplx_n"
+#: Where things are written inside the notebook. One archive + one
+#: extracted subfolder per dataset, all collected under EXTRACT_ROOT so the
+#: final published dataset has one top-level folder per sub-dataset.
+WORK_DIR = Path("/kaggle/working/amass_download")
+EXTRACT_ROOT = WORK_DIR / "extracted"
 
 # =============================================================================
 
@@ -178,25 +201,23 @@ def login_to_amass(email: str, password: str):
     return session
 
 
-def download_kit_archive(
+def download_dataset_archive(
     session, url: str, out_path: Path, form_data: dict | None = None
 ) -> None:
-    """Download the KIT archive with the authenticated session, and refuse
-    to accept an HTML page pretending to be one (the classic silent-failure
-    mode for gated downloads: auth fails, server serves you a login page,
-    and a script that doesn't check ends up "successfully" saving 2KB of
-    HTML as if it were a 660MB dataset).
+    """Download one dataset's archive with the authenticated session, and
+    refuse to accept an HTML page pretending to be one (the classic
+    silent-failure mode for gated downloads: auth fails, server serves you
+    a login page, and a script that doesn't check ends up "successfully"
+    saving 2KB of HTML as if it were a real dataset -- including a wrong
+    guess at a dataset's internal `name`, since that also 404s to an HTML
+    page rather than an archive).
 
     ``form_data``: pass a non-empty dict if DevTools showed the button as a
-    POST with a form body (see the KIT_DOWNLOAD_FORM_DATA comment above);
-    leave it empty for a plain GET link.
+    POST with a form body; leave it empty for a plain GET link (every
+    dataset captured so far has been a plain GET).
     """
     if not url:
-        raise ValueError(
-            "KIT_DOWNLOAD_URL is empty. See the comment above "
-            "KIT_DOWNLOAD_URL for how to get it from DevTools -- the "
-            "download buttons on that page are not plain links."
-        )
+        raise ValueError("No download URL given.")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"Downloading from: {url}" + (" (POST)" if form_data else " (GET)"))
@@ -303,9 +324,9 @@ def publish_to_kaggle(
 
     username = kaggle_username
     metadata = {
-        "title": "AMASS KIT (SMPL-X, neutral)",
+        "title": "AMASS (SMPL-X, neutral)",  # not "... KIT ..." anymore -- this now holds several sub-datasets
         "id": f"{username}/{dataset_slug}",
-        "licenses": [{"name": "other"}],  # AMASS/KIT license, not CC0
+        "licenses": [{"name": "other"}],  # AMASS license, not CC0
     }
     (source_dir / "dataset-metadata.json").write_text(json.dumps(metadata, indent=2))
 
@@ -335,16 +356,54 @@ def publish_to_kaggle(
     print(f'  prepare("/kaggle/input/{dataset_slug}")')
 
 
-def main() -> None:
+def main(extra_datasets: "dict[str, str] | None" = None) -> None:
+    """Download every dataset in AMASS_DATASETS (plus `extra_datasets`, if
+    given) and publish them together as one Kaggle dataset.
+
+    Args:
+        extra_datasets: More {display_name: url} entries for this run only,
+            for adding one dataset quickly without editing AMASS_DATASETS.
+            These are downloaded in addition to, not instead of, the ones
+            in AMASS_DATASETS.
+    """
     email = _secret("AMASS_EMAIL", "AMASS_EMAIL")
     password = _secret("AMASS_PASSWORD", "AMASS_PASSWORD")
     kaggle_username = _secret("KAGGLE_USERNAME", "KAGGLE_USERNAME")
     kaggle_key = _secret("KAGGLE_KEY", "KAGGLE_KEY")
 
+    datasets = {**AMASS_DATASETS, **(extra_datasets or {})}
     session = login_to_amass(email, password)
-    download_kit_archive(session, KIT_DOWNLOAD_URL, ARCHIVE_PATH, KIT_DOWNLOAD_FORM_DATA)
-    extract_archive(ARCHIVE_PATH, EXTRACT_DIR)
-    publish_to_kaggle(EXTRACT_DIR, KAGGLE_DATASET_SLUG, kaggle_username, kaggle_key)
+
+    succeeded, failed, skipped = [], [], []
+    for display_name, url in datasets.items():
+        print(f"\n=== {display_name} ===")
+        if not url:
+            print(f"SKIPPED: {display_name} -- no URL set. See the module docstring "
+                  f"for how to capture one from DevTools, then fill it in.")
+            skipped.append(display_name)
+            continue
+        try:
+            archive_path = WORK_DIR / f"{display_name}.archive"
+            out_dir = EXTRACT_ROOT / display_name
+            download_dataset_archive(session, url, archive_path, DOWNLOAD_FORM_DATA)
+            extract_archive(archive_path, out_dir)
+            succeeded.append(display_name)
+        except Exception as error:  # noqa: BLE001 - one bad URL must not stop the rest
+            print(f"FAILED: {display_name}: {error}")
+            failed.append((display_name, str(error)))
+
+    print(f"\n{len(succeeded)}/{len(datasets)} sub-datasets downloaded: {succeeded}")
+    if skipped:
+        print(f"{len(skipped)} skipped (no URL yet): {skipped}")
+    if failed:
+        print(f"{len(failed)} failed:")
+        for display_name, reason in failed:
+            print(f"  {display_name}: {reason}")
+
+    if not succeeded:
+        raise RuntimeError("Nothing downloaded successfully -- nothing to publish. See above.")
+
+    publish_to_kaggle(EXTRACT_ROOT, KAGGLE_DATASET_SLUG, kaggle_username, kaggle_key)
 
 
 if __name__ == "__main__":
