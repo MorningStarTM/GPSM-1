@@ -1,34 +1,26 @@
-"""Download several AMASS sub-datasets (SMPL-X, neutral) and publish them
-all as ONE Kaggle dataset, one subfolder per sub-dataset -- so "KIT" and
-"ACCAD" and whatever comes next all live under one Kaggle dataset (e.g.
+"""Download ONE AMASS sub-dataset (SMPL-X, neutral) and publish it under the
+same AMASS Kaggle dataset as every other one downloaded this way -- so "KIT"
+and "ACCAD" and whatever comes next all live under one Kaggle dataset (e.g.
 amass-kit-smplx-neutral), not as separate Kaggle datasets each.
 
-Meant to be run once (or re-run to add more sub-datasets later), inside a
-Kaggle notebook, so the motions live as a single Kaggle dataset that
-``src/gpsm/motionprep/kaggle.py``'s ``prepare()`` can point at in every
-later notebook, without re-downloading from AMASS each time.
+Call main() once per sub-dataset, with that dataset's own display name and
+download URL. Nothing else is re-downloaded.
 
-HOW TO GET EACH DATASET'S DOWNLOAD URL
-----------------------------------------
+HOW TO GET A DATASET'S DOWNLOAD URL
+--------------------------------------
 The download buttons on the AMASS page are not plain <a href> links
 (right-click -> "Copy link address" finds nothing). Capture the real
-request from DevTools instead, once per dataset you want:
+request from DevTools instead:
     1. Log in at https://amass.is.tue.mpg.de/download.php
     2. DevTools (F12) -> Network tab -> "Keep log" on -> clear the log
     3. Click that dataset's row's "SMPL-X N" button
     4. Right-click the request that appears -> Copy -> Copy as cURL
     5. Take just the URL out of that curl command (the one starting
-       https://download.is.tue.mpg.de/download.php?...) and add it to
-       AMASS_DATASETS below.
-This is deliberately not automated by guessing a folder-name pattern --
-an earlier version of this script did that, and about half the guessed
-names were unconfirmed. A pasted URL you have actually seen work in a
-browser is worth more than a guess with a "likely" label on it.
+       https://download.is.tue.mpg.de/download.php?...) and pass it to
+       main() below.
 
 A wrong or expired URL is not a silent failure: `download_dataset_archive`
-refuses to accept an HTML error page pretending to be an archive, so a bad
-entry shows up as a clear, per-dataset error rather than corrupt data --
-`main()` continues past one dataset's failure so it does not block the rest.
+refuses to accept an HTML error page pretending to be an archive.
 
 SETUP ON KAGGLE
 ----------------
@@ -44,22 +36,15 @@ SETUP ON KAGGLE
    If you ever paste a real password or API key into a chat or a terminal,
    treat it as burned: regenerate the Kaggle token and change the AMASS
    password rather than reuse them.
-3. AMASS_DATASETS below maps a display name (becomes the subfolder in the
-   published dataset) to the URL captured for it. Add entries as you
-   capture more; keep entries for anything already published, or a version
-   push may drop it (see the comment on AMASS_DATASETS). Only change
-   KAGGLE_DATASET_SLUG if you want this to become a different Kaggle
-   dataset than your existing one.
-4. Run this in a normal code cell -- NOT `!python scripts/...` (a shell
+3. Run this in a normal code cell -- NOT `!python scripts/...` (a shell
    subprocess can't reliably reach the Secrets connection, and can't be
    typed into if it falls back to asking):
      from scripts.download_kit_to_kaggle import main
-     main()
-   To add one more dataset without editing this file, pass it directly:
-     main(extra_datasets={"BMLmovi": "https://download.is.tue.mpg.de/..."})
+     main("ACCAD", "https://download.is.tue.mpg.de/download.php?...")
+   Call it again with a different name/url for the next sub-dataset.
 
 Result: a private Kaggle dataset at <your-username>/<KAGGLE_DATASET_SLUG>,
-with one subfolder per successfully-downloaded sub-dataset, ready for:
+with one subfolder per sub-dataset downloaded this way so far, ready for:
     from src.gpsm.motionprep.kaggle import prepare
     prepare("/kaggle/input/<KAGGLE_DATASET_SLUG>")
 """
@@ -76,25 +61,6 @@ from pathlib import Path
 # =============================================================================
 # CONFIG -- fill these in before running
 # =============================================================================
-
-#: display_name -> the exact URL captured from DevTools for that dataset's
-#: "SMPL-X N" button (see the module docstring for how). display_name also
-#: becomes that dataset's subfolder name in the published Kaggle dataset.
-#:
-#: Every run rebuilds EXTRACT_ROOT from whatever is listed here and pushes
-#: it as the new Kaggle dataset version -- so a sub-dataset already
-#: downloaded and published still has to stay listed here, or a version
-#: push risks dropping it (Kaggle's version-push semantics for a full
-#: folder replace were not confirmed either way, so the safe assumption is
-#: "replace, not merge").
-AMASS_DATASETS = {
-    "KIT": (
-        "https://download.is.tue.mpg.de/download.php"
-        "?domain=amass&resume=1"
-        "&sfile=amass_per_dataset/smplx/neutral/mosh_results/KIT.tar.bz2"
-    ),
-    "ACCAD": "",  # paste ACCAD's captured URL here (see the module docstring)
-}
 
 DOWNLOAD_FORM_DATA: dict = {}  # every captured request so far has been a plain GET, no form body
 
@@ -140,7 +106,7 @@ def _secret(name: str, env_fallback: str = "") -> str:
                 f"account.\n"
                 f"  2. Run this in a normal code cell, not `!python ...`:\n"
                 f"       from scripts.download_kit_to_kaggle import main\n"
-                f"       main()"
+                f"       main(\"ACCAD\", \"https://download.is.tue.mpg.de/...\")"
             ) from error
     if env_fallback and os.environ.get(env_fallback):
         return os.environ[env_fallback]
@@ -356,55 +322,34 @@ def publish_to_kaggle(
     print(f'  prepare("/kaggle/input/{dataset_slug}")')
 
 
-def main(extra_datasets: "dict[str, str] | None" = None) -> None:
-    """Download every dataset in AMASS_DATASETS (plus `extra_datasets`, if
-    given) and publish them together as one Kaggle dataset.
+def main(display_name: str, url: str) -> None:
+    """Download ONE AMASS sub-dataset and publish it under the AMASS Kaggle
+    dataset. Only `display_name`/`url` are fetched -- nothing else is
+    re-downloaded.
 
     Args:
-        extra_datasets: More {display_name: url} entries for this run only,
-            for adding one dataset quickly without editing AMASS_DATASETS.
-            These are downloaded in addition to, not instead of, the ones
-            in AMASS_DATASETS.
+        display_name: Becomes that sub-dataset's subfolder name in the
+            published Kaggle dataset (e.g. "ACCAD").
+        url: The exact URL captured from DevTools for that dataset's
+            "SMPL-X N" button (see the module docstring for how).
     """
     email = _secret("AMASS_EMAIL", "AMASS_EMAIL")
     password = _secret("AMASS_PASSWORD", "AMASS_PASSWORD")
     kaggle_username = _secret("KAGGLE_USERNAME", "KAGGLE_USERNAME")
     kaggle_key = _secret("KAGGLE_KEY", "KAGGLE_KEY")
 
-    datasets = {**AMASS_DATASETS, **(extra_datasets or {})}
     session = login_to_amass(email, password)
 
-    succeeded, failed, skipped = [], [], []
-    for display_name, url in datasets.items():
-        print(f"\n=== {display_name} ===")
-        if not url:
-            print(f"SKIPPED: {display_name} -- no URL set. See the module docstring "
-                  f"for how to capture one from DevTools, then fill it in.")
-            skipped.append(display_name)
-            continue
-        try:
-            archive_path = WORK_DIR / f"{display_name}.archive"
-            out_dir = EXTRACT_ROOT / display_name
-            download_dataset_archive(session, url, archive_path, DOWNLOAD_FORM_DATA)
-            extract_archive(archive_path, out_dir)
-            succeeded.append(display_name)
-        except Exception as error:  # noqa: BLE001 - one bad URL must not stop the rest
-            print(f"FAILED: {display_name}: {error}")
-            failed.append((display_name, str(error)))
-
-    print(f"\n{len(succeeded)}/{len(datasets)} sub-datasets downloaded: {succeeded}")
-    if skipped:
-        print(f"{len(skipped)} skipped (no URL yet): {skipped}")
-    if failed:
-        print(f"{len(failed)} failed:")
-        for display_name, reason in failed:
-            print(f"  {display_name}: {reason}")
-
-    if not succeeded:
-        raise RuntimeError("Nothing downloaded successfully -- nothing to publish. See above.")
+    archive_path = WORK_DIR / f"{display_name}.archive"
+    out_dir = EXTRACT_ROOT / display_name
+    download_dataset_archive(session, url, archive_path, DOWNLOAD_FORM_DATA)
+    extract_archive(archive_path, out_dir)
 
     publish_to_kaggle(EXTRACT_ROOT, KAGGLE_DATASET_SLUG, kaggle_username, kaggle_key)
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) != 3:
+        print(f"Usage: python {sys.argv[0]} <display_name> <url>")
+        sys.exit(1)
+    main(sys.argv[1], sys.argv[2])
