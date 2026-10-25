@@ -14,8 +14,7 @@ deadlocks.
 
 Loads train.pt / val.pt written by preprocess_motion_mamba_cache.py — no
 .npz scanning here, so this never burns GPU-session time on CPU-bound work
-(see that script's docstring for the full reasoning). Point CACHE_DIR at a
-Kaggle dataset published by that script (e.g. "motion-mamba-cache").
+(see that script's docstring for the full reasoning).
 
 How to confirm both GPUs are actually being used, and which files each one
 got: watch the cell output for lines like —
@@ -23,16 +22,24 @@ got: watch the cell output for lines like —
     [DDP] rank 0/1 ready on cuda:0 (Tesla T4)
     [DDP] rank 1/1 ready on cuda:1 (Tesla T4)
     [DDP] all 2 ranks initialized — training is running across 2 GPUs.
-    [DDP] rank 0 (cuda:0, Tesla T4): assigned files[0:12] -> 930 samples
-    [DDP] rank 1 (cuda:1, Tesla T4): assigned files[12:24] -> 912 samples
+    [DDP] rank 0 (cuda:0, Tesla T4): train files[0:12] -> 930 samples
+    [DDP] rank 1 (cuda:1, Tesla T4): train files[12:24] -> 912 samples
     [DDP] per-rank train batch counts: [7, 7] -> capped to 7 steps/epoch
 
-Usage (Kaggle notebook cell):
-    !python main_motion_mamba_ddp.py
-"""
+USAGE (Kaggle notebook cell)
+------------------------------
+    !python main_motion_mamba_ddp.py \\
+        --cache-dir /kaggle/input/motion-mamba-cache \\
+        --hf-repo-id ErnestBeckham/castor-50m
 
+--hf-repo-id is optional; omit it to just checkpoint locally. It needs an
+HF_TOKEN Kaggle Secret (write access) -- see src/gpsm/utils/hub.py.
+Run `python main_motion_mamba_ddp.py --help` for every option.
+"""
+from __future__ import annotations
+
+import argparse
 import math
-import os
 
 import torch
 import torch.distributed as dist
@@ -46,13 +53,7 @@ from src.gpsm.utils.cached_dataset import CachedWindowDataset
 from src.gpsm.utils.plotting import plot_training_history
 from src.gpsm.utils.logger import logger
 
-CACHE_DIR = "/kaggle/input/motion-mamba-cache"
-CKPT_DIR = "/kaggle/working/checkpoints"
-EPOCHS = 15
-BATCH_SIZE_PER_GPU = 128
-ACC_THRESHOLD = 0.5  # see MotionMambaTrainer._threshold_accuracy's docstring before trusting the default
-
-CONFIG = {
+MODEL_CONFIG = {
     "n_embd": 256, "n_layers": 4, "learning_rate": 1e-4, "dropout": 0.1,
     "loss_scale": 1.0, "d_state": 16, "d_conv": 4, "expand": 2,
     "dt_rank": math.ceil(256 / 16),
@@ -82,13 +83,13 @@ def _gathered_batch_counts(loader, rank: int, world_size: int):
     return [int(t.item()) for t in gathered]
 
 
-def train_worker(rank: int, world_size: int) -> None:
+def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     setup_ddp(rank, world_size)  # prints/logs the per-GPU "ready" banner
 
-    train_path = f"{CACHE_DIR}/train.pt"
-    val_path = f"{CACHE_DIR}/val.pt"
+    train_path = f"{args.cache_dir}/train.pt"
+    val_path = f"{args.cache_dir}/val.pt"
 
-    # How many files each dataset actually has, so the split is sized
+    # How many files each split actually has, so the split is sized
     # correctly per split rather than assuming train/val have equal counts.
     probe_train = CachedWindowDataset(train_path)
     probe_val = CachedWindowDataset(val_path)
@@ -105,8 +106,8 @@ def train_worker(rank: int, world_size: int) -> None:
     print(msg, flush=True)
     logger.info(msg)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE_PER_GPU, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE_PER_GPU, shuffle=False, drop_last=True)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size_per_gpu, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size_per_gpu, shuffle=False, drop_last=True)
 
     # Different file ranges -> likely different sample counts -> different
     # local batch counts. Gather every rank's count (for logging) and sync
@@ -121,35 +122,80 @@ def train_worker(rank: int, world_size: int) -> None:
         logger.info(f"[DDP] per-rank train batch counts: {train_counts} -> capped to {max_train_steps} steps/epoch")
         logger.info(f"[DDP] per-rank val batch counts: {val_counts} -> capped to {max_val_steps} steps/epoch")
 
-    config = dict(CONFIG)
+    config = dict(MODEL_CONFIG)
     config["state_dim"] = train_ds.state_dim
 
-    trainer = MotionMambaTrainer(config, ckpt_dir=CKPT_DIR)
+    trainer = MotionMambaTrainer(config, ckpt_dir=args.ckpt_dir)
     trainer.device = torch.device(f"cuda:{rank}")
     trainer.model.device = trainer.device
     trainer.model.to(trainer.device)
     trainer.model = DDP(trainer.model, device_ids=[rank])
 
+    best_path = f"{args.ckpt_dir}/best_motion_mamba"
     history = trainer.train(
         train_loader,
         val_loader=val_loader,
-        epochs=EPOCHS,
+        epochs=args.epochs,
         log_every=1,
-        best_path=f"{CKPT_DIR}/best_motion_mamba",
-        acc_threshold=ACC_THRESHOLD,
+        best_path=best_path,
+        acc_threshold=args.acc_threshold,
         max_steps_per_epoch=max_train_steps,
     )
 
     if rank == 0:
         plot_training_history(
-            history, out_path="/kaggle/working/training_history.png",
-            title="MotionMamba pretraining (DDP, 2x T4)", acc_threshold=ACC_THRESHOLD,
+            history, out_path=f"{args.ckpt_dir}/../training_history.png",
+            title="MotionMamba pretraining (DDP)", acc_threshold=args.acc_threshold,
         )
+        if args.hf_repo_id:
+            # Separate, optional step -- publishing a checkpoint is a
+            # decision distinct from training one, so it is skipped unless
+            # explicitly asked for (--hf-repo-id), same reasoning as
+            # src/gpsm/utils/hub.py keeping push_checkpoint_to_hub apart
+            # from the trainer itself.
+            from src.gpsm.utils.hub import push_checkpoint_to_hub
+            push_checkpoint_to_hub(best_path, args.hf_repo_id, private=not args.hf_public)
 
     cleanup_ddp()
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--cache-dir", default="/kaggle/input/motion-mamba-cache",
+        help="Folder holding train.pt/val.pt, written by "
+             "preprocess_motion_mamba_cache.py (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--ckpt-dir", default="/kaggle/working/checkpoints",
+        help="Where to write checkpoints locally (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--hf-repo-id", default=None,
+        help="If given, push the best checkpoint here (<username>/<name>) "
+             "after training -- rank 0 only. Needs an HF_TOKEN Kaggle "
+             "Secret with write access. Omit to skip publishing.",
+    )
+    parser.add_argument(
+        "--hf-public", action="store_true",
+        help="Create the Hugging Face repo as public. Default is private.",
+    )
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--batch-size-per-gpu", type=int, default=128)
+    parser.add_argument(
+        "--acc-threshold", type=float, default=0.5,
+        help="Tolerance for the threshold-accuracy metric -- see "
+             "MotionMambaTrainer._threshold_accuracy's docstring before "
+             "trusting the default (default: %(default)s)",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+
     world_size = torch.cuda.device_count()
     if world_size < 2:
         raise RuntimeError(
@@ -161,7 +207,7 @@ def main() -> None:
         f"{[torch.cuda.get_device_name(i) for i in range(world_size)]}",
         flush=True,
     )
-    mp.spawn(train_worker, args=(world_size,), nprocs=world_size, join=True)
+    mp.spawn(train_worker, args=(world_size, args), nprocs=world_size, join=True)
 
 
 if __name__ == "__main__":
