@@ -53,6 +53,12 @@ from src.gpsm.ssm.motion_mamba_sft_trainer import MotionMambaSFTTrainer
 from src.gpsm.experiment_model.distributed import setup_ddp, cleanup_ddp
 from src.gpsm.utils.cached_dataset import CachedSFTDataset
 from src.gpsm.utils.logger import logger
+from src.gpsm.utils.utils import load_yaml_config
+
+# Run-setting DEFAULTS: configs/motion_mamba_sft.yaml, not hardcoded here --
+# shared with main_motion_mamba_sft.py. Still overridable per-run via the
+# CLI flags below (yaml sets the default, flags take precedence).
+SFT_CONFIG = load_yaml_config("configs/motion_mamba_sft.yaml")
 
 
 def split_range(start: int, end: int, world_size: int, rank: int):
@@ -192,9 +198,11 @@ def parse_args() -> argparse.Namespace:
         "--hf-public", action="store_true",
         help="Create the Hugging Face repo as public. Default is private.",
     )
-    parser.add_argument("--n-frames", type=int, default=8, help="Rollout length supervised per sample")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size-per-gpu", type=int, default=64)
+    parser.add_argument("--n-frames", type=int, default=SFT_CONFIG["n_frames"],
+                         help="Rollout length supervised per sample (default: %(default)s, "
+                              "from configs/motion_mamba_sft.yaml)")
+    parser.add_argument("--epochs", type=int, default=SFT_CONFIG["epochs"])
+    parser.add_argument("--batch-size-per-gpu", type=int, default=SFT_CONFIG["batch_size_per_gpu"])
     return parser.parse_args()
 
 

@@ -1,5 +1,20 @@
 import yaml
 
+
+def load_yaml_config(path: str) -> dict:
+    """Load a YAML config file as a plain dict.
+
+    Deliberately not the `Config` class below: MotionMamba/the trainers all
+    expect a plain dict (`config["n_embd"]`, `dict(config)`,
+    `config.get("loss_scale", 1.0)`), and `Config` wraps values as
+    attribute-access objects instead -- using it here would need changes to
+    those classes too. This is the minimal, zero-risk way to stop
+    hardcoding the same config dict separately in every main_*.py script.
+    """
+    with open(path, "r") as file:
+        return yaml.safe_load(file)
+
+
 class Config:
     def __init__(self, dictionary):
         for key, value in dictionary.items():
