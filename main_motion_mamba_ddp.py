@@ -39,7 +39,6 @@ Run `python main_motion_mamba_ddp.py --help` for every option.
 from __future__ import annotations
 
 import argparse
-import math
 
 import torch
 import torch.distributed as dist
@@ -52,12 +51,12 @@ from src.gpsm.experiment_model.distributed import setup_ddp, cleanup_ddp
 from src.gpsm.utils.cached_dataset import CachedWindowDataset
 from src.gpsm.utils.plotting import plot_training_history
 from src.gpsm.utils.logger import logger
+from src.gpsm.utils.utils import load_yaml_config
 
-MODEL_CONFIG = {
-    "n_embd": 256, "n_layers": 4, "learning_rate": 1e-4, "dropout": 0.1,
-    "loss_scale": 1.0, "d_state": 16, "d_conv": 4, "expand": 2,
-    "dt_rank": math.ceil(256 / 16),
-}
+# configs/motion_mamba.yaml, not hardcoded here -- single source of truth,
+# shared with main_motion_mamba.py / main_motion_mamba_sft.py /
+# main_motion_mamba_sft_ddp.py.
+MODEL_CONFIG = load_yaml_config("configs/motion_mamba.yaml")
 
 
 def split_range(start: int, end: int, world_size: int, rank: int):

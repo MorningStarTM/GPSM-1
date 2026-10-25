@@ -18,11 +18,17 @@ from torch.utils.data import DataLoader
 
 from src.gpsm.ssm.motion_mamba_sft_trainer import MotionMambaSFTTrainer
 from src.gpsm.utils.cached_dataset import CachedSFTDataset
+from src.gpsm.utils.utils import load_yaml_config
+
+# Run settings: configs/motion_mamba_sft.yaml, not hardcoded here -- shared
+# with main_motion_mamba_sft_ddp.py, see that file for n_frames=16's
+# reasoning (and its fps caveat).
+SFT_CONFIG = load_yaml_config("configs/motion_mamba_sft.yaml")
 
 CACHE_DIR = "/kaggle/input/motion-mamba-cache"
 BASE_CHECKPOINT = "/kaggle/working/checkpoints/best_motion_mamba"   # the pretrained checkpoint, from main_motion_mamba(_ddp).py
 SFT_CHECKPOINT = "/kaggle/working/checkpoints/best_motion_mamba_sft"  # this run resumes from + overwrites this
-N_FRAMES = 8          # rollout length supervised per sample
+N_FRAMES = SFT_CONFIG["n_frames"]          # rollout length supervised per sample
 CKPT_DIR = "/kaggle/working/checkpoints"
 
 RESUME_FROM = SFT_CHECKPOINT if os.path.exists(f"{SFT_CHECKPOINT}.safetensors") else BASE_CHECKPOINT
@@ -46,8 +52,8 @@ if train_ds.state_dim != config["state_dim"]:
         "the same data the base checkpoint was trained on."
     )
 
-train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, drop_last=True)
-val_loader = DataLoader(val_ds, batch_size=128, shuffle=False, drop_last=True)
+train_loader = DataLoader(train_ds, batch_size=SFT_CONFIG["batch_size"], shuffle=True, drop_last=True)
+val_loader = DataLoader(val_ds, batch_size=SFT_CONFIG["batch_size"], shuffle=False, drop_last=True)
 
 print(f"SFT dataset: state_dim={train_ds.state_dim}, n_frames={N_FRAMES}, "
       f"train={len(train_ds)} samples across {train_ds.file_stats()['num_files']} files, "
@@ -57,7 +63,7 @@ trainer = MotionMambaSFTTrainer(config, ckpt_dir=CKPT_DIR, pretrained_checkpoint
 history = trainer.train(
     train_loader,
     val_loader=val_loader,
-    epochs=20,
+    epochs=SFT_CONFIG["epochs"],
     log_every=1,
     best_path=SFT_CHECKPOINT,
 )

@@ -5,31 +5,17 @@ this is a correctness check ("does the loss curve behave sensibly?"), not
 the final, full-budget training run.
 """
 
-import math
-
 from src.gpsm.ssm.motion_mamba_trainer import MotionMambaTrainer
 from torch.utils.data import DataLoader
 from src.gpsm.utils.dataset import MultiSMPLXNPZNextPoseDataset
+from src.gpsm.utils.utils import load_yaml_config
 
 
-config = {
-    "n_embd": 256,
-    "n_layers": 4,
-    "learning_rate": 1e-4,
-    "dropout": 0.1,
-    "loss_scale": 1.0,
-    # Mamba-specific (see motion_mamba.py) — no block_size/max_timestep/
-    # n_head here, unlike StateMachineGPT's config: an SSM needs none of
-    # those (see MotionMamba's docstring for why).
-    "d_state": 16,
-    "d_conv": 4,
-    "expand": 2,
-    # dt_rank is required explicitly (MotionMamba does not auto-compute
-    # it) — ceil(n_embd / 16) is the same heuristic the reference repos
-    # default to, used here for a sensible first value, not because it is
-    # required to be exactly this.
-    "dt_rank": math.ceil(256 / 16),
-}
+# Architecture + core hyperparameters: configs/motion_mamba.yaml, not
+# hardcoded here -- single source of truth, shared with
+# main_motion_mamba_ddp.py / main_motion_mamba_sft.py /
+# main_motion_mamba_sft_ddp.py, so they can't drift apart from each other.
+config = load_yaml_config("configs/motion_mamba.yaml")
 
 # Same dataset call as main.py, so this trains on the same data
 # (strict_dim=False keeps only the files matching the first-loaded file's
