@@ -438,6 +438,60 @@ Only worth importing directly if you're building a different renderer/viewer
 on top of the same scene layout; normal usage is through `live_viewer.py` /
 `offscreen_test.py` above.
 
+## Driving the model with the keyboard
+
+`simulator/play_model.py` is the playable test harness: hold a key, the model
+predicts the next pose, the SMPL-X body is posed with it, and the camera
+follows from behind. It is the closest thing here to what a game would do, and its purpose
+is to *see* whether the character obeys commands rather than trusting a loss
+number.
+
+```
+WASD + mouse ─> control vector ─> model ─> pose ─> SMPL-X body ─> screen
+                                  ^                               │
+                                  └───────── next frame ──────────┘
+```
+
+```bash
+# interactive window
+python -m simulator.play_model --checkpoint checkpoints/best_motion_mamba_control
+
+# same loop, no display: renders a scripted run to a GIF and checks every frame
+python -m simulator.play_model --headless --script idle,forward,left,forward,right,back
+
+pytest tests/test_play_simulator.py -v
+```
+
+Third-person controls, as in any other game: **W/S** walk forward and back,
+**A/D** step sideways, and the **mouse** steers — the character turns to face
+where you point, and the camera follows behind it. The mouse is captured on
+start; `q`/ESC releases it and quits. Pass `--no-mouse-grab` if capturing the
+cursor gets in the way (debugging on one screen, say), and steer by moving the
+mouse inside the window instead. Runs at about 19 ms per frame for the model
+plus SMPL-X posing, so ~50 fps before rendering.
+
+The camera is deliberately *not* the fly camera from the mocap viewer: WASD
+belongs to the character here, so `GameViewer` is constructed with
+`external_camera=True` and the follow camera is driven by the character's own
+heading.
+
+```
+simulator/
+├── control_input.py   keys + mouse -> the same 14 control numbers MotionPrep extracts
+├── live_model.py       rolling window -> model -> pose -> posed SMPL-X body
+└── play_model.py        the interactive window, plus a headless scripted mode
+```
+
+Two things to know before reading anything into what you see. The character is
+**seeded from a real clip** and reuses that clip's normalization statistics,
+because the model was trained on per-clip z-scored pose — a shipped game would
+train with fixed global statistics instead. And the current checkpoint does
+**not** obey commands well: held keys do change the motion, but the character
+walks off regardless of what it was told (with no keys held at all it still
+travels ~5.8 m in 3 s). That is a model-training issue, not a harness issue —
+see the rollout-drift discussion; the fix is training on multi-step rollouts
+rather than single-frame prediction.
+
 ## MotionPrep — the data pipeline
 
 `src/gpsm/motionprep/` turns a folder of mixed raw mocap into training-ready

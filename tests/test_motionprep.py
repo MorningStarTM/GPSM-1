@@ -317,3 +317,29 @@ def test_summarize_survives_a_run_that_never_started(tmp_path, capsys):
 
     summarize(str(tmp_path))
     assert "no manifest yet" in capsys.readouterr().out
+
+
+def test_missing_body_model_fails_once_not_once_per_file(tmp_path, monkeypatch):
+    """A missing SMPL-X model is a problem with the run, not with one file.
+
+    Loading it lazily inside the per-file try/except meant the same error was
+    caught and logged once per file — a batch of 3,911 markers produced 3,911
+    identical failures instead of stopping. It must now raise before any file
+    is processed, leaving no manifest rows behind.
+    """
+    from src.gpsm.smplx.config import SMPLXModelNotFoundError
+    import src.gpsm.smplx.fitting.body as bodymod
+    from src.gpsm.motionprep import unify
+
+    c3d_files = sorted(DATA_DIR.glob("c3d/*.c3d"))
+    if not c3d_files:
+        pytest.skip("no c3d files in data/")
+
+    monkeypatch.setattr(bodymod, "find_smplx_model", lambda: None)
+
+    with pytest.raises(SMPLXModelNotFoundError):
+        unify.run(str(DATA_DIR / "c3d"), str(tmp_path))
+
+    assert not (tmp_path / "manifest.csv").exists(), (
+        "nothing should have been attempted, so there should be no manifest"
+    )
