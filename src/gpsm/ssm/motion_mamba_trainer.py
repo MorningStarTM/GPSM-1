@@ -74,6 +74,39 @@ class MotionMambaTrainer:
             raise ValueError(f"Non-finite loss: {loss.item()}")
         return loss
 
+    def _threshold_accuracy(
+        self, logits: torch.Tensor, y: torch.Tensor, threshold: float
+    ) -> float:
+        """Fraction of frames whose prediction falls within `threshold` of
+        the target, measured as per-dimension RMSE (L2 distance / sqrt(D)),
+        not raw L2 distance.
+
+        This is NOT classification accuracy -- next-pose prediction is
+        regression, which has no natural "correct"/"incorrect" outcome to
+        count. This is the PCK-style ("percentage of correct keypoints")
+        threshold metric used in pose-estimation papers for exactly this
+        reason: pick a tolerance, report what fraction of predictions fall
+        within it. Report it in a paper as "frame-level threshold accuracy
+        (tau=<threshold>, per-dimension RMSE, normalized units)", not as
+        plain "accuracy" -- the value is meaningless without the threshold
+        and the fact that poses are per-channel z-score normalized, not in
+        physical units.
+
+        Per-dimension RMSE rather than raw L2 distance specifically:
+        ``||pred - y||_2`` grows with ``sqrt(D)``, so a fixed threshold
+        would silently mean something different for every ``state_dim`` --
+        measured directly: with state_dim=159 and threshold=0.5 (raw L2),
+        accuracy was 0.0 at every epoch even as loss fell from 0.198 to
+        0.032, because a typical error vector's L2 norm at D=159 is far
+        above 0.5 even when every individual dimension is well predicted.
+        Dividing by sqrt(D) keeps the threshold's meaning ("typical
+        per-channel error, in std-deviations") the same across pose widths.
+        """
+        pred = logits[:, -1, :] if logits.dim() == 3 else logits[-1]
+        d = pred.shape[-1]
+        per_frame_rmse = torch.linalg.norm(pred - y, dim=-1) / (d ** 0.5)
+        return float((per_frame_rmse < threshold).float().mean().item())
+
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
@@ -88,6 +121,7 @@ class MotionMambaTrainer:
         patience: int = 10,
         grad_clip_norm: float = 1.0,
         save_every_epochs: int = None,
+        acc_threshold: float = 0.5,
     ) -> dict:
         """Train the model. Same behaviour as ``SMTrainer.train()``.
 
@@ -100,14 +134,22 @@ class MotionMambaTrainer:
             patience          : Early-stop patience (epochs without improvement).
             grad_clip_norm    : Gradient clipping max norm (``0`` disables it).
             save_every_epochs : If set, also save a checkpoint every N epochs.
+            acc_threshold     : Tolerance (normalized pose-vector L2 distance)
+                                for the threshold-accuracy metric -- see
+                                ``_threshold_accuracy``. The default is a
+                                starting point, not a validated value; pick
+                                one deliberately for a paper and say so.
 
         Returns:
-            A history dict with ``"train_loss"`` (and ``"val_loss"`` if
-            ``val_loader`` was given).
+            A history dict with ``"train_loss"``/``"train_acc"`` (and the
+            ``val_`` equivalents if ``val_loader`` was given). ``*_acc`` is
+            threshold accuracy, not classification accuracy -- see
+            ``_threshold_accuracy``'s docstring before reporting it.
         """
-        history = {"train_loss": []}
+        history = {"train_loss": [], "train_acc": []}
         if val_loader is not None:
             history["val_loss"] = []
+            history["val_acc"] = []
 
         best_metric = math.inf
         best_epoch = 0
@@ -122,7 +164,7 @@ class MotionMambaTrainer:
 
             # ---- TRAIN ----
             self.model.train()
-            total, n = 0.0, 0
+            total, acc_total, n = 0.0, 0.0, 0
 
             for batch in train_loader:
                 x, y = batch
@@ -142,16 +184,20 @@ class MotionMambaTrainer:
                 self.optimizer.step()
 
                 total += float(loss.item())
+                with torch.no_grad():
+                    acc_total += self._threshold_accuracy(logits, y, acc_threshold)
                 n += 1
 
             train_loss = reduce_mean(total / max(n, 1), self.device)
+            train_acc = reduce_mean(acc_total / max(n, 1), self.device)
             history["train_loss"].append(train_loss)
+            history["train_acc"].append(train_acc)
 
             # ---- VALIDATION ----
             val_loss = None
             if val_loader is not None:
                 self.model.eval()
-                vtotal, vn = 0.0, 0
+                vtotal, vacc_total, vn = 0.0, 0.0, 0
                 with torch.no_grad():
                     for batch in val_loader:
                         x, y = batch
@@ -159,9 +205,12 @@ class MotionMambaTrainer:
                         y = y.to(self.device)
                         logits = self.model(x)
                         vtotal += float(self._compute_loss(logits, y).item())
+                        vacc_total += self._threshold_accuracy(logits, y, acc_threshold)
                         vn += 1
                 val_loss = reduce_mean(vtotal / max(vn, 1), self.device)
+                val_acc = reduce_mean(vacc_total / max(vn, 1), self.device)
                 history["val_loss"].append(val_loss)
+                history["val_acc"].append(val_acc)
 
             # ---- CHECKPOINT + EARLY STOPPING ----
             current_metric = val_loss if val_loader is not None else train_loss
@@ -190,11 +239,15 @@ class MotionMambaTrainer:
             # ---- LOG ----
             if (ep % log_every) == 0 and self._is_main():
                 if val_loader is None:
-                    logger.info(f"Epoch {ep}/{epochs} | train_loss={train_loss:.6f}")
+                    logger.info(
+                        f"Epoch {ep}/{epochs} | "
+                        f"train_loss={train_loss:.6f} | train_acc@{acc_threshold}={train_acc:.4f}"
+                    )
                 else:
                     logger.info(
                         f"Epoch {ep}/{epochs} | "
-                        f"train_loss={train_loss:.6f} | val_loss={val_loss:.6f}"
+                        f"train_loss={train_loss:.6f} | val_loss={val_loss:.6f} | "
+                        f"train_acc@{acc_threshold}={train_acc:.4f} | val_acc@{acc_threshold}={val_acc:.4f}"
                     )
 
         return history
