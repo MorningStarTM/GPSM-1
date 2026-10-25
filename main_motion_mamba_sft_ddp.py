@@ -31,7 +31,7 @@ USAGE (Kaggle notebook cell)
     !python main_motion_mamba_sft_ddp.py \\
         --cache-dir /kaggle/input/motion-mamba-cache \\
         --base-checkpoint /kaggle/working/checkpoints/best_motion_mamba \\
-        --hf-repo-id ErnestBeckham/castor-50m-sft
+        --hf-repo-id <your-username>/<gpsm-sft-checkpoint-repo-name>
 
 --hf-repo-id is optional; omit it to just checkpoint locally. It needs an
 HF_TOKEN Kaggle Secret (write access) -- see src/gpsm/utils/hub.py.
