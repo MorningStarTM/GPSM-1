@@ -122,6 +122,7 @@ class MotionMambaTrainer:
         grad_clip_norm: float = 1.0,
         save_every_epochs: int = None,
         acc_threshold: float = 0.5,
+        max_steps_per_epoch: int = None,
     ) -> dict:
         """Train the model. Same behaviour as ``SMTrainer.train()``.
 
@@ -139,6 +140,20 @@ class MotionMambaTrainer:
                                 ``_threshold_accuracy``. The default is a
                                 starting point, not a validated value; pick
                                 one deliberately for a paper and say so.
+            max_steps_per_epoch: If set, stop each epoch after this many
+                                batches. Required under DDP when ranks hold
+                                different-sized shards (e.g. different file
+                                ranges per GPU) -- every rank MUST call
+                                backward() the same number of times per
+                                epoch, or the rank(s) that run out of
+                                batches first leave the others hanging on
+                                the next gradient all-reduce and the whole
+                                job deadlocks. Pass the cross-rank MINIMUM
+                                batch count here (see
+                                main_motion_mamba_ddp.py for how it's
+                                computed) -- same mechanism as
+                                ``SFTTrainer.train()``'s parameter of the
+                                same name.
 
         Returns:
             A history dict with ``"train_loss"``/``"train_acc"`` (and the
@@ -166,7 +181,13 @@ class MotionMambaTrainer:
             self.model.train()
             total, acc_total, n = 0.0, 0.0, 0
 
-            for batch in train_loader:
+            for step, batch in enumerate(train_loader):
+                # See max_steps_per_epoch's docstring above -- every DDP
+                # rank must call backward() the same number of times per
+                # epoch, or the all-reduce deadlocks.
+                if max_steps_per_epoch is not None and step >= max_steps_per_epoch:
+                    break
+
                 x, y = batch
                 x = x.to(self.device)
                 y = y.to(self.device)
@@ -199,7 +220,9 @@ class MotionMambaTrainer:
                 self.model.eval()
                 vtotal, vacc_total, vn = 0.0, 0.0, 0
                 with torch.no_grad():
-                    for batch in val_loader:
+                    for vstep, batch in enumerate(val_loader):
+                        if max_steps_per_epoch is not None and vstep >= max_steps_per_epoch:
+                            break
                         x, y = batch
                         x = x.to(self.device)
                         y = y.to(self.device)
