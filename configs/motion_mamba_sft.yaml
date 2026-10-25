@@ -1,0 +1,20 @@
+# MotionMamba SFT (free-running multi-step rollout) run settings.
+# See src/gpsm/ssm/motion_mamba_sft_trainer.py's module docstring for why
+# SFT is a distinct phase from pretraining.
+
+# Rollout length supervised per sample, in FRAMES -- how many steps the
+# model generates on its own before being scored against the real
+# continuation. Chosen to cover the control vector's longest look-ahead
+# horizon (0.5s) at ~30fps (15 frames, rounded up).
+#
+# Caveat: this is a frame count, not yet a fixed duration across the whole
+# corpus -- native fps varies by source file (measured directly: 120fps for
+# one AMASS export convention, 100fps for another), and nothing in the
+# current pipeline resamples to a common rate. At 100fps, 16 frames is only
+# ~0.16s, well under the 0.5s target. Revisit this value once fps
+# normalization is added.
+n_frames: 16
+
+epochs: 20
+batch_size: 128          # single-GPU (main_motion_mamba_sft.py)
+batch_size_per_gpu: 256   # per rank under DDP (main_motion_mamba_sft_ddp.py)

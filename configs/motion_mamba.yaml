@@ -1,0 +1,26 @@
+# MotionMamba architecture + core training hyperparameters.
+#
+# Single source of truth: every main_motion_mamba*.py script loads this
+# instead of hardcoding its own copy, so they can no longer drift apart
+# from each other (they used to each have their own separate dict).
+#
+# state_dim is NOT here -- it's derived from the dataset at load time
+# (ds.D / the cache's meta), not a fixed architecture choice, since it
+# depends on which feature_set the data was built with.
+
+n_embd: 256
+n_layers: 4
+learning_rate: 0.0001
+dropout: 0.1
+loss_scale: 1.0
+
+# Mamba-specific (see src/gpsm/ssm/motion_mamba.py's module docstring for
+# what each of these means -- an SSM needs none of a transformer's
+# block_size/max_timestep/n_head).
+d_state: 16
+d_conv: 4
+expand: 2
+# ceil(n_embd / 16) -- the same heuristic the reference Mamba repos default
+# to. Written out literally since YAML can't compute it: if you change
+# n_embd, update this to match (ceil(new_n_embd / 16)).
+dt_rank: 16
