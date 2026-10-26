@@ -8,92 +8,161 @@ Does NOT require a pretrained checkpoint -- pretraining (main_motion_mamba.py
 / main_motion_mamba_ddp.py) was decided to be skipped in favor of starting
 SFT directly from a fresh, randomly-initialized model. If no SFT checkpoint
 exists yet either, this starts from scratch using configs/motion_mamba.yaml
-for the architecture. If you ever DO want to warm-start from an existing
-pretrained checkpoint instead, set BASE_CHECKPOINT below.
+for the architecture. Pass --base-checkpoint if you ever DO want to warm-start
+from an existing pretrained checkpoint instead.
 
 Resuming works the same way either way: if best_motion_mamba_sft already
 exists (e.g. a later chunk/session), this picks it back up automatically --
 that part is unaffected by skipping pretraining.
 
 Reads from the same train.pt / val.pt cache written by
-scripts/preprocess_motion_mamba_cache.py and already published as the
-"motion-mamba-cache" Kaggle dataset -- no re-preprocessing needed.
+scripts/preprocess_motion_mamba_cache.py. No hardcoded Kaggle path --
+--cache-dir takes whatever directory you actually downloaded it to, so this
+runs the same way on Kaggle, Colab, or local.
 
-Usage (Kaggle notebook cell):
-    !python main_motion_mamba_sft.py
+USAGE
+------
+    !python main_motion_mamba_sft.py \\
+        --cache-dir /content/motion-mamba-cache \\
+        --hf-repo-id <your-username>/<gpsm-sft-checkpoint-repo-name>
+
+--hf-repo-id is optional; omit it to just checkpoint locally. It needs an
+HF_TOKEN available the way src/gpsm/utils/hub.py's _hub_token() resolves it
+(Kaggle Secret, or an HF_TOKEN env var -- set that yourself on Colab, there
+is no Kaggle-Secrets equivalent there).
+Run `python main_motion_mamba_sft.py --help` for every option.
 """
+from __future__ import annotations
+
+import argparse
 import json
 import os
+
 from torch.utils.data import DataLoader
 
 from src.gpsm.ssm.motion_mamba_sft_trainer import MotionMambaSFTTrainer
 from src.gpsm.utils.cached_dataset import CachedSFTDataset
 from src.gpsm.utils.utils import load_yaml_config
 
-# Run settings: configs/motion_mamba_sft.yaml, not hardcoded here -- shared
-# with main_motion_mamba_sft_ddp.py, see that file for n_frames=16's
-# reasoning (and its fps caveat).
+# Run-setting DEFAULTS: configs/motion_mamba_sft.yaml, not hardcoded here --
+# shared with main_motion_mamba_sft_ddp.py. Still overridable per-run via
+# the CLI flags below (yaml sets the default, flags take precedence).
 SFT_CONFIG = load_yaml_config("configs/motion_mamba_sft.yaml")
 
-CACHE_DIR = "/kaggle/input/motion-mamba-cache"
-SFT_CHECKPOINT = "/kaggle/working/checkpoints/best_motion_mamba_sft"  # this run resumes from + overwrites this
-BASE_CHECKPOINT = None  # optional: a pretrained checkpoint prefix to warm-start from, instead of training from scratch
-N_FRAMES = SFT_CONFIG["n_frames"]          # rollout length supervised per sample
-CKPT_DIR = "/kaggle/working/checkpoints"
 
-if os.path.exists(f"{SFT_CHECKPOINT}.safetensors"):
-    # Resuming an in-progress SFT run -- reuse ITS saved config so the
-    # fresh model MotionMambaSFTTrainer builds matches the saved weights
-    # exactly (load_safetensors requires an identical config and raises
-    # otherwise).
-    resume_from = SFT_CHECKPOINT
-    with open(f"{resume_from}.json", "r") as f:
-        config = json.load(f)["config"]
-    print(f"Resuming SFT from: {resume_from}")
-elif BASE_CHECKPOINT and os.path.exists(f"{BASE_CHECKPOINT}.safetensors"):
-    # Optional warm start from an existing pretrained checkpoint, if you
-    # set BASE_CHECKPOINT above.
-    resume_from = BASE_CHECKPOINT
-    with open(f"{resume_from}.json", "r") as f:
-        config = json.load(f)["config"]
-    print(f"Starting SFT from pretrained checkpoint: {resume_from}")
-else:
-    # Fresh start, no pretraining phase: architecture comes from
-    # configs/motion_mamba.yaml, state_dim filled in below once the
-    # dataset is loaded. No block_size check here, unlike sft_main.py's
-    # StateMachineGPT version -- an SSM has no such concept.
-    resume_from = None
-    config = load_yaml_config("configs/motion_mamba.yaml")
-    print("Starting SFT from scratch (no pretrained checkpoint) -- "
-          "architecture from configs/motion_mamba.yaml")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--cache-dir", required=True,
+        help="Folder holding train.pt/val.pt, written by "
+             "preprocess_motion_mamba_cache.py -- wherever you actually "
+             "downloaded it to (e.g. /kaggle/input/motion-mamba-cache on "
+             "Kaggle, /content/motion-mamba-cache on Colab). No default: "
+             "a wrong silent default is exactly the bug this replaces.",
+    )
+    parser.add_argument(
+        "--ckpt-dir", default="checkpoints",
+        help="Where SFT checkpoints are written locally, and where an "
+             "existing best_motion_mamba_sft is looked for to resume "
+             "(default: %(default)s)",
+    )
+    parser.add_argument(
+        "--base-checkpoint", default=None,
+        help="Optional: a pretrained checkpoint prefix to warm-start SFT "
+             "from. Only used if no SFT checkpoint already exists at "
+             "--ckpt-dir to resume from. Omit to start from scratch "
+             "(architecture from configs/motion_mamba.yaml) -- pretraining "
+             "is not required.",
+    )
+    parser.add_argument(
+        "--hf-repo-id", default=None,
+        help="If given, push the best SFT checkpoint here (<username>/<name>) "
+             "after training. Needs an HF token -- see src/gpsm/utils/hub.py's "
+             "_hub_token(). Omit to skip publishing.",
+    )
+    parser.add_argument(
+        "--hf-public", action="store_true",
+        help="Create the Hugging Face repo as public. Default is private.",
+    )
+    parser.add_argument("--n-frames", type=int, default=SFT_CONFIG["n_frames"],
+                         help="Rollout length supervised per sample (default: %(default)s, "
+                              "from configs/motion_mamba_sft.yaml)")
+    parser.add_argument("--epochs", type=int, default=SFT_CONFIG["epochs"])
+    parser.add_argument("--batch-size", type=int, default=SFT_CONFIG["batch_size"])
+    return parser.parse_args()
 
-train_ds = CachedSFTDataset(f"{CACHE_DIR}/train.pt", n_frames=N_FRAMES)
-val_ds = CachedSFTDataset(f"{CACHE_DIR}/val.pt", n_frames=N_FRAMES)
 
-if "state_dim" not in config:
-    config["state_dim"] = train_ds.state_dim
-elif train_ds.state_dim != config["state_dim"]:
-    raise ValueError(
-        f"Cache state_dim={train_ds.state_dim} does not match the resumed "
-        f"checkpoint's state_dim={config['state_dim']} -- check the cache "
-        "was built from the same data that checkpoint was trained on."
+def main() -> None:
+    args = parse_args()
+
+    sft_checkpoint = f"{args.ckpt_dir}/best_motion_mamba_sft"
+
+    if os.path.exists(f"{sft_checkpoint}.safetensors"):
+        # Resuming an in-progress SFT run -- reuse ITS saved config so the
+        # fresh model MotionMambaSFTTrainer builds matches the saved
+        # weights exactly (load_safetensors requires an identical config
+        # and raises otherwise).
+        resume_from = sft_checkpoint
+        with open(f"{resume_from}.json", "r") as f:
+            config = json.load(f)["config"]
+        print(f"Resuming SFT from: {resume_from}")
+    elif args.base_checkpoint and os.path.exists(f"{args.base_checkpoint}.safetensors"):
+        # Optional warm start from an existing pretrained checkpoint, if
+        # --base-checkpoint was given.
+        resume_from = args.base_checkpoint
+        with open(f"{resume_from}.json", "r") as f:
+            config = json.load(f)["config"]
+        print(f"Starting SFT from pretrained checkpoint: {resume_from}")
+    else:
+        # Fresh start, no pretraining phase: architecture comes from
+        # configs/motion_mamba.yaml, state_dim filled in below once the
+        # dataset is loaded. No block_size check here, unlike sft_main.py's
+        # StateMachineGPT version -- an SSM has no such concept.
+        resume_from = None
+        config = load_yaml_config("configs/motion_mamba.yaml")
+        print("Starting SFT from scratch (no pretrained checkpoint) -- "
+              "architecture from configs/motion_mamba.yaml")
+
+    train_ds = CachedSFTDataset(f"{args.cache_dir}/train.pt", n_frames=args.n_frames)
+    val_ds = CachedSFTDataset(f"{args.cache_dir}/val.pt", n_frames=args.n_frames)
+
+    if "state_dim" not in config:
+        config["state_dim"] = train_ds.state_dim
+    elif train_ds.state_dim != config["state_dim"]:
+        raise ValueError(
+            f"Cache state_dim={train_ds.state_dim} does not match the resumed "
+            f"checkpoint's state_dim={config['state_dim']} -- check the cache "
+            "was built from the same data that checkpoint was trained on."
+        )
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=True)
+
+    print(f"SFT dataset: state_dim={train_ds.state_dim}, n_frames={args.n_frames}, "
+          f"train={len(train_ds)} samples across {train_ds.file_stats()['num_files']} files, "
+          f"val={len(val_ds)} samples across {val_ds.file_stats()['num_files']} files")
+
+    trainer = MotionMambaSFTTrainer(config, ckpt_dir=args.ckpt_dir, pretrained_checkpoint=resume_from)
+    history = trainer.train(
+        train_loader,
+        val_loader=val_loader,
+        epochs=args.epochs,
+        log_every=1,
+        best_path=sft_checkpoint,
     )
 
-train_loader = DataLoader(train_ds, batch_size=SFT_CONFIG["batch_size"], shuffle=True, drop_last=True)
-val_loader = DataLoader(val_ds, batch_size=SFT_CONFIG["batch_size"], shuffle=False, drop_last=True)
+    print("train_loss per epoch:", [f"{v:.6f}" for v in history["train_loss"]])
+    print("val_loss per epoch:", [f"{v:.6f}" for v in history["val_loss"]])
 
-print(f"SFT dataset: state_dim={train_ds.state_dim}, n_frames={N_FRAMES}, "
-      f"train={len(train_ds)} samples across {train_ds.file_stats()['num_files']} files, "
-      f"val={len(val_ds)} samples across {val_ds.file_stats()['num_files']} files")
+    if args.hf_repo_id:
+        # Separate, optional step -- publishing a checkpoint is a decision
+        # distinct from training one, same reasoning as
+        # main_motion_mamba_ddp.py / main_motion_mamba_sft_ddp.py.
+        from src.gpsm.utils.hub import push_checkpoint_to_hub
+        push_checkpoint_to_hub(sft_checkpoint, args.hf_repo_id, private=not args.hf_public)
 
-trainer = MotionMambaSFTTrainer(config, ckpt_dir=CKPT_DIR, pretrained_checkpoint=resume_from)
-history = trainer.train(
-    train_loader,
-    val_loader=val_loader,
-    epochs=SFT_CONFIG["epochs"],
-    log_every=1,
-    best_path=SFT_CHECKPOINT,
-)
 
-print("train_loss per epoch:", [f"{v:.6f}" for v in history["train_loss"]])
-print("val_loss per epoch:", [f"{v:.6f}" for v in history["val_loss"]])
+if __name__ == "__main__":
+    main()
