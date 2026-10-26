@@ -3,10 +3,17 @@ Distributed (multi-GPU) MotionMamba SFT entrypoint — for Kaggle's dual T4
 (T4 x2) or any multi-GPU machine.
 
 Adapts main_motion_mamba_ddp.py's design to the SFT phase (free-running
-multi-step rollout, resumed from a pretrained checkpoint) exactly the way
-sft_main_ddp.py adapts its own non-SFT sibling -- see
-src/gpsm/ssm/motion_mamba_sft_trainer.py's module docstring for why SFT is
-a distinct phase from pretraining.
+multi-step rollout) the way sft_main_ddp.py adapts its own non-SFT sibling
+-- see src/gpsm/ssm/motion_mamba_sft_trainer.py's module docstring for why
+multi-step rollout is a different training objective from single-step
+teacher forcing.
+
+Does NOT require a pretrained checkpoint -- pretraining was decided to be
+skipped in favor of starting SFT directly from a fresh, randomly-
+initialized model (architecture from configs/motion_mamba.yaml). Pass
+--base-checkpoint if you ever DO want to warm-start from an existing
+pretrained checkpoint instead; resuming an in-progress SFT run (e.g. a
+later chunk/session) still works automatically either way.
 
 Same file-sharding rationale and deadlock fix as main_motion_mamba_ddp.py:
 each GPU gets a disjoint, contiguous slice of the *cached* file list, and
@@ -30,8 +37,10 @@ USAGE (Kaggle notebook cell)
 ------------------------------
     !python main_motion_mamba_sft_ddp.py \\
         --cache-dir /kaggle/input/motion-mamba-cache \\
-        --base-checkpoint /kaggle/working/checkpoints/best_motion_mamba \\
         --hf-repo-id <your-username>/<gpsm-sft-checkpoint-repo-name>
+
+No --base-checkpoint needed for a fresh start. Add it only to warm-start
+from an existing pretrained checkpoint instead.
 
 --hf-repo-id is optional; omit it to just checkpoint locally. It needs an
 HF_TOKEN Kaggle Secret (write access) -- see src/gpsm/utils/hub.py.
@@ -88,17 +97,36 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     setup_ddp(rank, world_size)  # prints/logs the per-GPU "ready" banner
 
     sft_checkpoint = f"{args.ckpt_dir}/best_motion_mamba_sft"
-    resume_from = sft_checkpoint if os.path.exists(f"{sft_checkpoint}.safetensors") else args.base_checkpoint
-    if rank == 0:
-        logger.info(f"[DDP] resuming from: {resume_from}")
-
-    # Reuse the checkpoint's own config so the fresh model
-    # MotionMambaSFTTrainer builds matches the saved weights exactly --
-    # load_safetensors requires an identical config and raises otherwise.
-    # No block_size check here, unlike sft_main_ddp.py's StateMachineGPT
-    # version -- an SSM has no such concept.
-    with open(f"{resume_from}.json", "r") as f:
-        config = json.load(f)["config"]
+    if os.path.exists(f"{sft_checkpoint}.safetensors"):
+        # Resuming an in-progress SFT run -- reuse ITS saved config so the
+        # fresh model MotionMambaSFTTrainer builds matches the saved
+        # weights exactly (load_safetensors requires an identical config
+        # and raises otherwise).
+        resume_from = sft_checkpoint
+        with open(f"{resume_from}.json", "r") as f:
+            config = json.load(f)["config"]
+        if rank == 0:
+            logger.info(f"[DDP] resuming SFT from: {resume_from}")
+    elif args.base_checkpoint and os.path.exists(f"{args.base_checkpoint}.safetensors"):
+        # Optional warm start from an existing pretrained checkpoint, if
+        # --base-checkpoint was given.
+        resume_from = args.base_checkpoint
+        with open(f"{resume_from}.json", "r") as f:
+            config = json.load(f)["config"]
+        if rank == 0:
+            logger.info(f"[DDP] starting SFT from pretrained checkpoint: {resume_from}")
+    else:
+        # Fresh start, no pretraining phase: architecture comes from
+        # configs/motion_mamba.yaml, state_dim filled in below once the
+        # dataset is loaded. No block_size check here, unlike
+        # sft_main_ddp.py's StateMachineGPT version -- an SSM has no such
+        # concept.
+        from src.gpsm.utils.utils import load_yaml_config
+        resume_from = None
+        config = load_yaml_config("configs/motion_mamba.yaml")
+        if rank == 0:
+            logger.info("[DDP] starting SFT from scratch (no pretrained checkpoint) -- "
+                        "architecture from configs/motion_mamba.yaml")
 
     train_path = f"{args.cache_dir}/train.pt"
     val_path = f"{args.cache_dir}/val.pt"
@@ -112,11 +140,13 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     train_ds = CachedSFTDataset(train_path, n_frames=args.n_frames, file_range=train_range)
     val_ds = CachedSFTDataset(val_path, n_frames=args.n_frames, file_range=val_range)
 
-    if train_ds.state_dim != config["state_dim"]:
+    if "state_dim" not in config:
+        config["state_dim"] = train_ds.state_dim
+    elif train_ds.state_dim != config["state_dim"]:
         raise ValueError(
-            f"Cache state_dim={train_ds.state_dim} does not match pretrained "
-            f"state_dim={config['state_dim']} -- check the cache was built from "
-            "the same data the base checkpoint was trained on."
+            f"Cache state_dim={train_ds.state_dim} does not match the resumed "
+            f"checkpoint's state_dim={config['state_dim']} -- check the cache "
+            "was built from the same data that checkpoint was trained on."
         )
 
     msg = (f"[DDP] rank {rank} (cuda:{rank}, {torch.cuda.get_device_name(rank)}): "
@@ -177,10 +207,12 @@ def parse_args() -> argparse.Namespace:
              "preprocess_motion_mamba_cache.py (default: %(default)s)",
     )
     parser.add_argument(
-        "--base-checkpoint", default="/kaggle/working/checkpoints/best_motion_mamba",
-        help="Pretrained checkpoint prefix to start SFT from, only used if "
-             "no SFT checkpoint already exists at --ckpt-dir to resume from "
-             "(default: %(default)s)",
+        "--base-checkpoint", default=None,
+        help="Optional: a pretrained checkpoint prefix to warm-start SFT "
+             "from. Only used if no SFT checkpoint already exists at "
+             "--ckpt-dir to resume from. Omit to start from scratch "
+             "(architecture from configs/motion_mamba.yaml) -- pretraining "
+             "is not required.",
     )
     parser.add_argument(
         "--ckpt-dir", default="/kaggle/working/checkpoints",
