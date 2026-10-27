@@ -56,11 +56,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cache-dir", required=True,
-        help="Folder holding train.pt/val.pt, written by "
+        help="Folder holding the train shard(s) + val.pt, written by "
              "preprocess_motion_mamba_cache.py -- wherever you actually "
              "downloaded it to (e.g. /kaggle/input/motion-mamba-cache on "
              "Kaggle, /content/motion-mamba-cache on Colab). No default: "
              "a wrong silent default is exactly the bug this replaces.",
+    )
+    parser.add_argument(
+        "--train-file", default="train.pt",
+        help="Which train file under --cache-dir to use this run -- if the "
+             "cache was built with --frames-per-shard, pass one shard, e.g. "
+             "'train_3.pt', to train on that portion only (move to the next "
+             "shard next session). Defaults to 'train.pt' for an "
+             "unsharded/single-file cache.",
     )
     parser.add_argument(
         "--ckpt-dir", default="checkpoints",
@@ -125,7 +133,7 @@ def main() -> None:
         print("Starting SFT from scratch (no pretrained checkpoint) -- "
               "architecture from configs/motion_mamba.yaml")
 
-    train_ds = CachedSFTDataset(f"{args.cache_dir}/train.pt", n_frames=args.n_frames)
+    train_ds = CachedSFTDataset(f"{args.cache_dir}/{args.train_file}", n_frames=args.n_frames)
     val_ds = CachedSFTDataset(f"{args.cache_dir}/val.pt", n_frames=args.n_frames)
 
     if "state_dim" not in config:

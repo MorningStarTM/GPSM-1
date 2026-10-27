@@ -128,7 +128,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             logger.info("[DDP] starting SFT from scratch (no pretrained checkpoint) -- "
                         "architecture from configs/motion_mamba.yaml")
 
-    train_path = f"{args.cache_dir}/train.pt"
+    train_path = f"{args.cache_dir}/{args.train_file}"
     val_path = f"{args.cache_dir}/val.pt"
 
     probe_train = CachedSFTDataset(train_path, n_frames=args.n_frames)
@@ -203,8 +203,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--cache-dir", default="/kaggle/input/motion-mamba-cache",
-        help="Folder holding train.pt/val.pt, written by "
+        help="Folder holding the train shard(s) + val.pt, written by "
              "preprocess_motion_mamba_cache.py (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--train-file", default="train.pt",
+        help="Which train file under --cache-dir to use this run -- if the "
+             "cache was built with --frames-per-shard, pass one shard, e.g. "
+             "'train_3.pt', to train on that portion only (move to the next "
+             "shard next session). Defaults to 'train.pt' for an "
+             "unsharded/single-file cache.",
     )
     parser.add_argument(
         "--base-checkpoint", default=None,
