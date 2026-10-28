@@ -130,6 +130,15 @@ def parse_args() -> argparse.Namespace:
                               "from configs/motion_mamba_sft.yaml)")
     parser.add_argument("--epochs", type=int, default=SFT_CONFIG["epochs"])
     parser.add_argument("--batch-size", type=int, default=SFT_CONFIG["batch_size"])
+    parser.add_argument(
+        "--no-val", action="store_true",
+        help="Skip loading and evaluating val.pt entirely during training. "
+             "val.pt is NOT sharded, so it can be much bigger than a single "
+             "train shard -- do a separate validation pass once all chunks "
+             "are trained instead. With this set, checkpointing falls back "
+             "to train_loss as the 'best' metric (MotionMambaSFTTrainer's "
+             "existing behaviour whenever val_loader is None).",
+    )
     return parser.parse_args()
 
 
@@ -165,23 +174,35 @@ def main() -> None:
               "architecture from configs/motion_mamba.yaml")
 
     train_ds = CachedSFTDataset(_resolve_train_path(args.cache_dir, args.train_file), n_frames=args.n_frames)
-    val_ds = CachedSFTDataset(f"{args.cache_dir}/val.pt", n_frames=args.n_frames)
 
     if "state_dim" not in config:
         config["state_dim"] = train_ds.state_dim
-    elif train_ds.state_dim != config["state_dim"]:
-        raise ValueError(
-            f"Cache state_dim={train_ds.state_dim} does not match the resumed "
-            f"checkpoint's state_dim={config['state_dim']} -- check the cache "
-            "was built from the same data that checkpoint was trained on."
-        )
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=True)
 
-    print(f"SFT dataset: state_dim={train_ds.state_dim}, n_frames={args.n_frames}, "
-          f"train={len(train_ds)} samples across {train_ds.file_stats()['num_files']} files, "
-          f"val={len(val_ds)} samples across {val_ds.file_stats()['num_files']} files")
+    # val.pt is NOT sharded (see preprocess_motion_mamba_cache.py), so it
+    # can be far bigger than any single train shard -- disproportionately
+    # expensive to even load, let alone evaluate, every epoch while
+    # training in small chunks. --no-val skips constructing it at all,
+    # not just skips scoring it, since loading is the costly part here.
+    # Do a separate validation pass once all chunks are trained instead.
+    val_loader = None
+    if not args.no_val:
+        val_ds = CachedSFTDataset(f"{args.cache_dir}/val.pt", n_frames=args.n_frames)
+        if val_ds.state_dim != config["state_dim"]:
+            raise ValueError(
+                f"Cache state_dim={val_ds.state_dim} does not match the resumed "
+                f"checkpoint's state_dim={config['state_dim']} -- check the cache "
+                "was built from the same data that checkpoint was trained on."
+            )
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=True)
+        print(f"SFT dataset: state_dim={train_ds.state_dim}, n_frames={args.n_frames}, "
+              f"train={len(train_ds)} samples across {train_ds.file_stats()['num_files']} files, "
+              f"val={len(val_ds)} samples across {val_ds.file_stats()['num_files']} files")
+    else:
+        print(f"SFT dataset: state_dim={train_ds.state_dim}, n_frames={args.n_frames}, "
+              f"train={len(train_ds)} samples across {train_ds.file_stats()['num_files']} files, "
+              f"val SKIPPED (--no-val)")
 
     trainer = MotionMambaSFTTrainer(config, ckpt_dir=args.ckpt_dir, pretrained_checkpoint=resume_from)
     history = trainer.train(
@@ -193,7 +214,8 @@ def main() -> None:
     )
 
     print("train_loss per epoch:", [f"{v:.6f}" for v in history["train_loss"]])
-    print("val_loss per epoch:", [f"{v:.6f}" for v in history["val_loss"]])
+    if "val_loss" in history:
+        print("val_loss per epoch:", [f"{v:.6f}" for v in history["val_loss"]])
 
     if args.hf_repo_id:
         # Separate, optional step -- publishing a checkpoint is a decision

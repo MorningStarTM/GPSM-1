@@ -158,43 +158,58 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
                         "architecture from configs/motion_mamba.yaml")
 
     train_path = _resolve_train_path(args.cache_dir, args.train_file)
-    val_path = f"{args.cache_dir}/val.pt"
 
     probe_train = CachedSFTDataset(train_path, n_frames=args.n_frames)
-    probe_val = CachedSFTDataset(val_path, n_frames=args.n_frames)
     train_range = split_range(0, len(probe_train._files), world_size, rank)
-    val_range = split_range(0, len(probe_val._files), world_size, rank)
-    del probe_train, probe_val
+    del probe_train
 
     train_ds = CachedSFTDataset(train_path, n_frames=args.n_frames, file_range=train_range)
-    val_ds = CachedSFTDataset(val_path, n_frames=args.n_frames, file_range=val_range)
 
     if "state_dim" not in config:
         config["state_dim"] = train_ds.state_dim
-    elif train_ds.state_dim != config["state_dim"]:
-        raise ValueError(
-            f"Cache state_dim={train_ds.state_dim} does not match the resumed "
-            f"checkpoint's state_dim={config['state_dim']} -- check the cache "
-            "was built from the same data that checkpoint was trained on."
-        )
-
-    msg = (f"[DDP] rank {rank} (cuda:{rank}, {torch.cuda.get_device_name(rank)}): "
-           f"train files{list(train_range)} -> {len(train_ds)} samples, "
-           f"val files{list(val_range)} -> {len(val_ds)} samples")
-    print(msg, flush=True)
-    logger.info(msg)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size_per_gpu, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size_per_gpu, shuffle=False, drop_last=True)
-
     train_counts = _gathered_batch_counts(train_loader, rank, world_size)
-    val_counts = _gathered_batch_counts(val_loader, rank, world_size)
     max_train_steps = min(train_counts) if min(train_counts) > 0 else None
-    max_val_steps = min(val_counts) if min(val_counts) > 0 else None
 
-    if rank == 0:
-        logger.info(f"[DDP] per-rank train batch counts: {train_counts} -> capped to {max_train_steps} steps/epoch")
-        logger.info(f"[DDP] per-rank val batch counts: {val_counts} -> capped to {max_val_steps} steps/epoch")
+    # val.pt is NOT sharded (see preprocess_motion_mamba_cache.py), so it
+    # can be far bigger than any single train shard -- disproportionately
+    # expensive to even load, let alone evaluate, every epoch while
+    # training in small chunks. --no-val skips constructing it (and its
+    # own DDP file-range split / batch-count sync) entirely, not just
+    # skips scoring it. Do a separate validation pass once all chunks are
+    # trained instead.
+    val_loader = None
+    if not args.no_val:
+        val_path = f"{args.cache_dir}/val.pt"
+        probe_val = CachedSFTDataset(val_path, n_frames=args.n_frames)
+        val_range = split_range(0, len(probe_val._files), world_size, rank)
+        del probe_val
+        val_ds = CachedSFTDataset(val_path, n_frames=args.n_frames, file_range=val_range)
+        if val_ds.state_dim != config["state_dim"]:
+            raise ValueError(
+                f"Cache state_dim={val_ds.state_dim} does not match the resumed "
+                f"checkpoint's state_dim={config['state_dim']} -- check the cache "
+                "was built from the same data that checkpoint was trained on."
+            )
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size_per_gpu, shuffle=False, drop_last=True)
+        val_counts = _gathered_batch_counts(val_loader, rank, world_size)
+
+        msg = (f"[DDP] rank {rank} (cuda:{rank}, {torch.cuda.get_device_name(rank)}): "
+               f"train files{list(train_range)} -> {len(train_ds)} samples, "
+               f"val files{list(val_range)} -> {len(val_ds)} samples")
+        print(msg, flush=True)
+        logger.info(msg)
+        if rank == 0:
+            logger.info(f"[DDP] per-rank train batch counts: {train_counts} -> capped to {max_train_steps} steps/epoch")
+            logger.info(f"[DDP] per-rank val batch counts: {val_counts} -> capped to {min(val_counts)} steps/epoch")
+    else:
+        msg = (f"[DDP] rank {rank} (cuda:{rank}, {torch.cuda.get_device_name(rank)}): "
+               f"train files{list(train_range)} -> {len(train_ds)} samples, val SKIPPED (--no-val)")
+        print(msg, flush=True)
+        logger.info(msg)
+        if rank == 0:
+            logger.info(f"[DDP] per-rank train batch counts: {train_counts} -> capped to {max_train_steps} steps/epoch")
 
     trainer = MotionMambaSFTTrainer(config, ckpt_dir=args.ckpt_dir, pretrained_checkpoint=resume_from)
 
@@ -272,6 +287,15 @@ def parse_args() -> argparse.Namespace:
                               "from configs/motion_mamba_sft.yaml)")
     parser.add_argument("--epochs", type=int, default=SFT_CONFIG["epochs"])
     parser.add_argument("--batch-size-per-gpu", type=int, default=SFT_CONFIG["batch_size_per_gpu"])
+    parser.add_argument(
+        "--no-val", action="store_true",
+        help="Skip loading and evaluating val.pt entirely during training. "
+             "val.pt is NOT sharded, so it can be much bigger than a single "
+             "train shard -- do a separate validation pass once all chunks "
+             "are trained instead. With this set, checkpointing falls back "
+             "to train_loss as the 'best' metric (MotionMambaSFTTrainer's "
+             "existing behaviour whenever val_loader is None).",
+    )
     return parser.parse_args()
 
 
