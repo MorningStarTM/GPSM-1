@@ -144,6 +144,7 @@ class MotionMambaSFTTrainer:
         grad_clip_norm: float = 1.0,
         save_every_epochs: int = None,
         max_steps_per_epoch: int = None,
+        on_checkpoint_saved=None,
     ) -> dict:
         """
         Args:
@@ -171,6 +172,23 @@ class MotionMambaSFTTrainer:
                                    all-reduce and the whole job deadlocks.
                                    Pass the cross-rank MINIMUM batch count
                                    here.
+            on_checkpoint_saved : optional ``callable(best_path)``, called
+                                   (rank 0 only) right after a new best
+                                   checkpoint is written to disk -- every
+                                   epoch that improves, not just once at the
+                                   end of training. This is how a caller
+                                   plugs in e.g. a Hugging Face push without
+                                   this trainer needing to know anything
+                                   about HF (see src/gpsm/utils/hub.py's
+                                   docstring on why the trainer and the
+                                   publish step stay separate). Pushing only
+                                   after train() returns would mean a
+                                   session that dies mid-run -- which is
+                                   exactly the failure mode long-running
+                                   jobs hit -- never gets anything to HF at
+                                   all, even though every earlier epoch's
+                                   improvement was saved locally the whole
+                                   time.
 
         Returns:
             history dict with 'train_loss' (and 'val_loss' if val_loader given)
@@ -249,6 +267,8 @@ class MotionMambaSFTTrainer:
                 if self._is_main():
                     self._module().save_safetensors(best_path)
                     logger.info(f"[ckpt] saved best @ epoch {ep}: metric={best_metric:.6f}")
+                    if on_checkpoint_saved is not None:
+                        on_checkpoint_saved(best_path)
             else:
                 bad_epochs += 1
                 if bad_epochs >= patience:

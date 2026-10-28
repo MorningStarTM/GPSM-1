@@ -91,6 +91,18 @@ def main() -> None:
     print(f"Using state_dim={ds.D} (from dataset), {len(ds)} samples across {ds.file_stats()['num_files']} files")
 
     best_path = f"{args.ckpt_dir}/best_motion_mamba"
+
+    # Push on EVERY new-best checkpoint, not just once after all epochs --
+    # a session that dies mid-run would otherwise leave nothing on HF at
+    # all, even though every earlier epoch's improvement was saved locally
+    # the whole time.
+    on_checkpoint_saved = None
+    if args.hf_repo_id:
+        from src.gpsm.utils.hub import push_checkpoint_to_hub
+
+        def on_checkpoint_saved(path):  # noqa: F811
+            push_checkpoint_to_hub(path, args.hf_repo_id, private=not args.hf_public)
+
     trainer = MotionMambaTrainer(config, ckpt_dir=args.ckpt_dir)
     history = trainer.train(
         train_loader,
@@ -98,15 +110,10 @@ def main() -> None:
         epochs=args.epochs,
         log_every=1,
         best_path=best_path,
+        on_checkpoint_saved=on_checkpoint_saved,
     )
 
     print("train_loss per epoch:", [f"{v:.6f}" for v in history["train_loss"]])
-
-    if args.hf_repo_id:
-        # Separate, optional step -- publishing a checkpoint is a decision
-        # distinct from training one, same reasoning as the DDP scripts.
-        from src.gpsm.utils.hub import push_checkpoint_to_hub
-        push_checkpoint_to_hub(best_path, args.hf_repo_id, private=not args.hf_public)
 
 
 if __name__ == "__main__":

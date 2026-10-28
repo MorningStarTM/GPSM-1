@@ -204,6 +204,17 @@ def main() -> None:
               f"train={len(train_ds)} samples across {train_ds.file_stats()['num_files']} files, "
               f"val SKIPPED (--no-val)")
 
+    # Push on EVERY new-best checkpoint, not just once after all epochs --
+    # a session that dies mid-run would otherwise leave nothing on HF at
+    # all, even though every earlier epoch's improvement was saved locally
+    # the whole time.
+    on_checkpoint_saved = None
+    if args.hf_repo_id:
+        from src.gpsm.utils.hub import push_checkpoint_to_hub
+
+        def on_checkpoint_saved(path):  # noqa: F811
+            push_checkpoint_to_hub(path, args.hf_repo_id, private=not args.hf_public)
+
     trainer = MotionMambaSFTTrainer(config, ckpt_dir=args.ckpt_dir, pretrained_checkpoint=resume_from)
     history = trainer.train(
         train_loader,
@@ -211,18 +222,12 @@ def main() -> None:
         epochs=args.epochs,
         log_every=1,
         best_path=sft_checkpoint,
+        on_checkpoint_saved=on_checkpoint_saved,
     )
 
     print("train_loss per epoch:", [f"{v:.6f}" for v in history["train_loss"]])
     if "val_loss" in history:
         print("val_loss per epoch:", [f"{v:.6f}" for v in history["val_loss"]])
-
-    if args.hf_repo_id:
-        # Separate, optional step -- publishing a checkpoint is a decision
-        # distinct from training one, same reasoning as
-        # main_motion_mamba_ddp.py / main_motion_mamba_sft_ddp.py.
-        from src.gpsm.utils.hub import push_checkpoint_to_hub
-        push_checkpoint_to_hub(sft_checkpoint, args.hf_repo_id, private=not args.hf_public)
 
 
 if __name__ == "__main__":

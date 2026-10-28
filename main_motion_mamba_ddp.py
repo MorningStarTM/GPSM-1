@@ -131,6 +131,21 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     trainer.model = DDP(trainer.model, device_ids=[rank])
 
     best_path = f"{args.ckpt_dir}/best_motion_mamba"
+
+    # Push on EVERY new-best checkpoint, not just once after all epochs --
+    # a session that dies mid-run would otherwise leave nothing on HF at
+    # all, even though every earlier epoch's improvement was saved locally
+    # the whole time. Same reasoning as src/gpsm/utils/hub.py keeping
+    # push_checkpoint_to_hub apart from the trainer itself: publishing
+    # stays opt-in (--hf-repo-id) and the trainer never needs to know
+    # anything about HF, just that a callback exists.
+    on_checkpoint_saved = None
+    if args.hf_repo_id:
+        from src.gpsm.utils.hub import push_checkpoint_to_hub
+
+        def on_checkpoint_saved(path):  # noqa: F811
+            push_checkpoint_to_hub(path, args.hf_repo_id, private=not args.hf_public)
+
     history = trainer.train(
         train_loader,
         val_loader=val_loader,
@@ -139,6 +154,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         best_path=best_path,
         acc_threshold=args.acc_threshold,
         max_steps_per_epoch=max_train_steps,
+        on_checkpoint_saved=on_checkpoint_saved,
     )
 
     if rank == 0:
@@ -146,14 +162,6 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             history, out_path=f"{args.ckpt_dir}/../training_history.png",
             title="MotionMamba pretraining (DDP)", acc_threshold=args.acc_threshold,
         )
-        if args.hf_repo_id:
-            # Separate, optional step -- publishing a checkpoint is a
-            # decision distinct from training one, so it is skipped unless
-            # explicitly asked for (--hf-repo-id), same reasoning as
-            # src/gpsm/utils/hub.py keeping push_checkpoint_to_hub apart
-            # from the trainer itself.
-            from src.gpsm.utils.hub import push_checkpoint_to_hub
-            push_checkpoint_to_hub(best_path, args.hf_repo_id, private=not args.hf_public)
 
     cleanup_ddp()
 

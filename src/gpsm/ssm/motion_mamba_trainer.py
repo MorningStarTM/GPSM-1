@@ -123,6 +123,7 @@ class MotionMambaTrainer:
         save_every_epochs: int = None,
         acc_threshold: float = 0.5,
         max_steps_per_epoch: int = None,
+        on_checkpoint_saved=None,
     ) -> dict:
         """Train the model. Same behaviour as ``SMTrainer.train()``.
 
@@ -154,6 +155,19 @@ class MotionMambaTrainer:
                                 computed) -- same mechanism as
                                 ``SFTTrainer.train()``'s parameter of the
                                 same name.
+            on_checkpoint_saved : optional ``callable(best_path)``, called
+                                (rank 0 only) right after a new best
+                                checkpoint is written to disk -- every
+                                epoch that improves, not just once at the
+                                end of training. Lets a caller plug in a
+                                Hugging Face push without this trainer
+                                needing to know anything about HF (see
+                                src/gpsm/utils/hub.py's docstring) --
+                                pushing only after train() returns would
+                                mean a session that dies mid-run never gets
+                                anything to HF, even though every earlier
+                                epoch's improvement was saved locally the
+                                whole time.
 
         Returns:
             A history dict with ``"train_loss"``/``"train_acc"`` (and the
@@ -245,6 +259,8 @@ class MotionMambaTrainer:
                 if self._is_main():
                     self._module().save_safetensors(best_path)
                     logger.info(f"[ckpt] saved best @ epoch {ep}: metric={best_metric:.6f}")
+                    if on_checkpoint_saved is not None:
+                        on_checkpoint_saved(best_path)
             else:
                 bad_epochs += 1
                 if bad_epochs >= patience:

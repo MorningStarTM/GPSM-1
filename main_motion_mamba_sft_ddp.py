@@ -222,6 +222,19 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
     trainer.model.to(trainer.device)
     trainer.model = DDP(trainer.model, device_ids=[rank])
 
+    # Push on EVERY new-best checkpoint, not just once after all epochs --
+    # a session that dies mid-run (the exact failure mode a 20-epoch,
+    # hours-long job is prone to) would otherwise leave nothing on HF at
+    # all, even though every earlier epoch's improvement was saved locally
+    # the whole time. push_checkpoint_to_hub() only runs rank 0 ever calls
+    # it (same guard the trainer already uses for local saves).
+    on_checkpoint_saved = None
+    if args.hf_repo_id:
+        from src.gpsm.utils.hub import push_checkpoint_to_hub
+
+        def on_checkpoint_saved(path):  # noqa: F811
+            push_checkpoint_to_hub(path, args.hf_repo_id, private=not args.hf_public)
+
     history = trainer.train(
         train_loader,
         val_loader=val_loader,
@@ -229,14 +242,8 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         log_every=1,
         best_path=sft_checkpoint,
         max_steps_per_epoch=max_train_steps,
+        on_checkpoint_saved=on_checkpoint_saved,
     )
-
-    if rank == 0 and args.hf_repo_id:
-        # Separate, optional step -- publishing a checkpoint is a decision
-        # distinct from training one, same reasoning as
-        # main_motion_mamba_ddp.py.
-        from src.gpsm.utils.hub import push_checkpoint_to_hub
-        push_checkpoint_to_hub(sft_checkpoint, args.hf_repo_id, private=not args.hf_public)
 
     cleanup_ddp()
 
