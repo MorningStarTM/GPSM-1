@@ -24,7 +24,15 @@ USAGE
 ------
     !python main_motion_mamba_sft.py \\
         --cache-dir /content/motion-mamba-cache \\
+        --train-file train_1.pt \\
         --hf-repo-id <your-username>/<gpsm-sft-checkpoint-repo-name>
+
+--train-file defaults to "train.pt" -- if the cache was built with
+--frames-per-shard (scripts/preprocess_motion_mamba_cache.py) and you only
+downloaded one shard, you MUST pass --train-file explicitly (e.g.
+"train_1.pt"), or it will look for a plain "train.pt" that was never
+downloaded and fail. If you forget, the error now lists which train*.pt
+files actually exist in --cache-dir, instead of a bare "not found".
 
 --hf-repo-id is optional; omit it to just checkpoint locally. It needs an
 HF_TOKEN available the way src/gpsm/utils/hub.py's _hub_token() resolves it
@@ -37,6 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 
 from torch.utils.data import DataLoader
 
@@ -48,6 +57,28 @@ from src.gpsm.utils.utils import load_yaml_config
 # shared with main_motion_mamba_sft_ddp.py. Still overridable per-run via
 # the CLI flags below (yaml sets the default, flags take precedence).
 SFT_CONFIG = load_yaml_config("configs/motion_mamba_sft.yaml")
+
+
+def _resolve_train_path(cache_dir: str, train_file: str) -> str:
+    """Full path to the requested train file, or a clear, actionable error
+    listing what's actually in --cache-dir instead of a bare
+    FileNotFoundError -- this exact confusion (--train-file left at its
+    "train.pt" default when only a shard like "train_1.pt" was downloaded)
+    has happened once already and gave no hint what to fix."""
+    path = Path(cache_dir) / train_file
+    if path.exists():
+        return str(path)
+    available = sorted(p.name for p in Path(cache_dir).glob("train*.pt"))
+    if available:
+        raise FileNotFoundError(
+            f"{path} not found. Files actually in {cache_dir}: {available}. "
+            f"If the cache was built with --frames-per-shard, pass the exact "
+            f"shard via --train-file, e.g. --train-file {available[0]}."
+        )
+    raise FileNotFoundError(
+        f"{path} not found, and no train*.pt files exist in {cache_dir} at "
+        f"all -- check --cache-dir points at the right folder."
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -133,7 +164,7 @@ def main() -> None:
         print("Starting SFT from scratch (no pretrained checkpoint) -- "
               "architecture from configs/motion_mamba.yaml")
 
-    train_ds = CachedSFTDataset(f"{args.cache_dir}/{args.train_file}", n_frames=args.n_frames)
+    train_ds = CachedSFTDataset(_resolve_train_path(args.cache_dir, args.train_file), n_frames=args.n_frames)
     val_ds = CachedSFTDataset(f"{args.cache_dir}/val.pt", n_frames=args.n_frames)
 
     if "state_dim" not in config:

@@ -37,7 +37,13 @@ USAGE (Kaggle notebook cell)
 ------------------------------
     !python main_motion_mamba_sft_ddp.py \\
         --cache-dir /kaggle/input/motion-mamba-cache \\
+        --train-file train_1.pt \\
         --hf-repo-id <your-username>/<gpsm-sft-checkpoint-repo-name>
+
+--train-file defaults to "train.pt" -- if the cache was built with
+--frames-per-shard and you only have one shard, you MUST pass --train-file
+explicitly, or it looks for a plain "train.pt" that doesn't exist. If you
+forget, the error now lists which train*.pt files are actually there.
 
 No --base-checkpoint needed for a fresh start. Add it only to warm-start
 from an existing pretrained checkpoint instead.
@@ -51,6 +57,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -68,6 +75,28 @@ from src.gpsm.utils.utils import load_yaml_config
 # shared with main_motion_mamba_sft.py. Still overridable per-run via the
 # CLI flags below (yaml sets the default, flags take precedence).
 SFT_CONFIG = load_yaml_config("configs/motion_mamba_sft.yaml")
+
+
+def _resolve_train_path(cache_dir: str, train_file: str) -> str:
+    """Full path to the requested train file, or a clear, actionable error
+    listing what's actually in --cache-dir instead of a bare
+    FileNotFoundError -- this exact confusion (--train-file left at its
+    "train.pt" default when only a shard like "train_1.pt" was downloaded)
+    has happened once already and gave no hint what to fix."""
+    path = Path(cache_dir) / train_file
+    if path.exists():
+        return str(path)
+    available = sorted(p.name for p in Path(cache_dir).glob("train*.pt"))
+    if available:
+        raise FileNotFoundError(
+            f"{path} not found. Files actually in {cache_dir}: {available}. "
+            f"If the cache was built with --frames-per-shard, pass the exact "
+            f"shard via --train-file, e.g. --train-file {available[0]}."
+        )
+    raise FileNotFoundError(
+        f"{path} not found, and no train*.pt files exist in {cache_dir} at "
+        f"all -- check --cache-dir points at the right folder."
+    )
 
 
 def split_range(start: int, end: int, world_size: int, rank: int):
@@ -128,7 +157,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
             logger.info("[DDP] starting SFT from scratch (no pretrained checkpoint) -- "
                         "architecture from configs/motion_mamba.yaml")
 
-    train_path = f"{args.cache_dir}/{args.train_file}"
+    train_path = _resolve_train_path(args.cache_dir, args.train_file)
     val_path = f"{args.cache_dir}/val.pt"
 
     probe_train = CachedSFTDataset(train_path, n_frames=args.n_frames)
