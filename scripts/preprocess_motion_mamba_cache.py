@@ -1,6 +1,22 @@
 """One-time CPU-only preprocessing: scan every mocap .npz once, build and
-normalize pose features, split by FILE into train/val, and cache the result
-as train_1.pt, train_2.pt, ... (val.pt stays one file -- see below).
+normalize pose features, extract the per-frame *control* vector (the same
+one play_model.py's player steering needs), split by FILE into train/val,
+and cache the result as train_1.pt, train_2.pt, ... (val.pt stays one file
+-- see below).
+
+CONTROL IS EXTRACTED IN THE SAME PASS, NOT A SEPARATE STEP
+------------------------------------------------------------
+Control (src/gpsm/control/control_features.py's extract_control) needs the
+file's *raw* trans + root orientation + frame rate -- not the cached,
+per-file-normalized pose array -- so it is read straight from each .npz via
+root_trajectory_from_npz() while that file is already open for the pose
+scan below, instead of a second script that re-reads the finished cache (the
+cache's X has already lost the per-file mean/std and fps that control needs,
+and even if it hadn't, reopening the original .npz once is simpler than
+re-deriving raw units from a normalized array). This keeps "run one script
+in Kaggle, get train_N.pt/val.pt ready to train on" true for control-
+conditioned training too, not just pose-only. Pass --no-control to skip it
+and reproduce the old pose-only cache.
 
 WHY THIS EXISTS
 ----------------
@@ -83,6 +99,7 @@ LOADING ONE SHARD FOR TRAINING
     windows = []  # (x, y) pairs, built lazily -- cheap, see module docstring
     for rec in cache["files"]:
         X = rec["X"]                      # (T, D) -- already normalized
+        control = rec.get("control")      # (T, C) -- raw units, not normalized (see module docstring)
         for t in rec["valid_t"]:
             windows.append((X[t - k:t + 1], X[t + 1]))
     # wrap `windows` in any torch.utils.data.Dataset / DataLoader as usual.
@@ -93,11 +110,14 @@ import argparse
 import math
 import random
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Sequence
 
 import torch
 
+from src.gpsm.control.control_features import DEFAULT_HORIZONS_SECONDS, extract_control
+from src.gpsm.control.root_trajectory import root_trajectory_from_npz
 from src.gpsm.utils.dataset import MultiSMPLXNPZNextPoseDataset
+from src.gpsm.utils.logger import logger
 
 
 def _shard_by_frames(records: List[dict], frames_per_shard: int) -> List[List[dict]]:
@@ -124,6 +144,28 @@ def _shard_by_frames(records: List[dict], frames_per_shard: int) -> List[List[di
     return shards
 
 
+def _file_control(path, horizons_seconds: Sequence[float]) -> Optional[dict]:
+    """Control vector + validity mask for one raw .npz, straight from the
+    file (not the cached, normalized pose array -- see module docstring).
+    Returns None (rather than raising) if the file has no frame-rate key or
+    too few frames for extract_control -- the same per-file "skip, don't
+    kill the whole run" behaviour MultiSMPLXNPZNextPoseDataset already uses
+    for pose-feature failures, so one odd file in a large Kaggle corpus
+    doesn't abort an otherwise-fine scan."""
+    try:
+        trajectory = root_trajectory_from_npz(str(path))
+        control = extract_control(trajectory, horizons_seconds=horizons_seconds)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: skip, don't abort the scan
+        logger.warning(f"Skipping control for {path}: {exc}")
+        return None
+    return {
+        "control": torch.from_numpy(control.values).float(),      # (T, C), raw units -- not normalized
+        "control_valid": torch.from_numpy(control.valid).bool(),  # (T,)
+        "control_fps": control.fps,
+        "control_names": control.names,
+    }
+
+
 def build_and_split(
     data_dir: str,
     out_dir: str,
@@ -134,6 +176,8 @@ def build_and_split(
     seed: int = 0,
     strict_dim: bool = False,
     kaggle_dataset_slug: str = None,
+    extract_control_vectors: bool = True,
+    horizons_seconds: Sequence[float] = DEFAULT_HORIZONS_SECONDS,
 ) -> None:
     """Run the one-time scan, write train_1.pt/train_2.pt/.../val.pt, and
     (if a slug is given) push them to an actual Kaggle dataset in the same
@@ -164,6 +208,17 @@ def build_and_split(
                          via download_kit_to_kaggle.py's already-tested
                          publish_to_kaggle (needs KAGGLE_USERNAME/KAGGLE_KEY
                          Secrets). Omit to just save locally.
+        extract_control_vectors: If True (default), also compute each
+                         file's control vector (see module docstring) and
+                         store it alongside its pose features. A file that
+                         fails control extraction (no frame-rate key, too
+                         short) is dropped entirely rather than cached
+                         without control -- a pose-only record would
+                         silently poison a control-conditioned training run
+                         that assumes every record has one.
+        horizons_seconds: Look-ahead times (seconds) for the control
+                         vector's "where will the root be" columns -- see
+                         extract_control's docstring.
     """
     print(f"Scanning {data_dir} ...")
     ds = MultiSMPLXNPZNextPoseDataset(
@@ -182,9 +237,28 @@ def build_and_split(
     print(f"Scanned {stats['num_files']} files -> {len(ds)} windowed samples "
           f"(k={k}), state_dim={ds.D}")
 
-    num_files = len(ds._files)
+    # Control is extracted here, straight from each raw .npz (see module
+    # docstring for why), while we already have every file's path in hand.
+    # A file control extraction fails for is dropped from the cache
+    # entirely, same "skip, don't poison the run" reasoning as the
+    # pose-feature scan above.
+    usable_file_ids = list(range(len(ds._files)))
+    control_by_file = {}
+    if extract_control_vectors:
+        dropped = 0
+        for file_i in usable_file_ids:
+            control = _file_control(ds._files[file_i]["path"], horizons_seconds)
+            if control is None:
+                dropped += 1
+                continue
+            control_by_file[file_i] = control
+        usable_file_ids = sorted(control_by_file.keys())
+        print(f"Control extraction: {len(usable_file_ids)} files kept, "
+              f"{dropped} dropped (no frame-rate key / too short)")
+
+    num_files = len(usable_file_ids)
     rng = random.Random(seed)
-    file_order = list(range(num_files))
+    file_order = list(usable_file_ids)
     rng.shuffle(file_order)
     n_val_files = max(1, int(round(num_files * val_fraction))) if num_files > 1 else 0
     val_file_ids = set(file_order[:n_val_files])
@@ -194,16 +268,25 @@ def build_and_split(
         records = []
         for file_i in sorted(file_ids):
             rec = ds._files[file_i]
-            records.append({
+            record = {
                 "path": str(rec["path"]),
                 "X": torch.from_numpy(rec["X_np"]).float(),  # (T, D) -- built, gap-filled, normalized
                 "valid_t": rec["valid_t"],
-            })
+            }
+            if extract_control_vectors:
+                record.update(control_by_file[file_i])
+            records.append(record)
         return records
 
     train_records = pack(train_file_ids)
     val_records = pack(val_file_ids)
 
+    control_dim = None
+    control_names = None
+    if extract_control_vectors and (train_records or val_records):
+        sample_rec = train_records[0] if train_records else val_records[0]
+        control_dim = sample_rec["control"].shape[1]
+        control_names = sample_rec["control_names"]
     meta = {
         "state_dim": ds.D,
         "k": k,
@@ -212,6 +295,9 @@ def build_and_split(
         "val_fraction": val_fraction,
         "frames_per_shard": frames_per_shard,
         "source_dir": str(data_dir),
+        "control_dim": control_dim,
+        "control_names": control_names,
+        "control_horizons_seconds": list(horizons_seconds) if extract_control_vectors else None,
     }
 
     out = Path(out_dir)
@@ -266,6 +352,12 @@ def main() -> None:
     parser.add_argument("--strict-dim", action="store_true")
     parser.add_argument("--kaggle-dataset-slug", default=None,
                          help="If given, also push the shards + val.pt to this Kaggle dataset slug")
+    parser.add_argument("--no-control", dest="extract_control_vectors", action="store_false",
+                         help="Skip control extraction and reproduce the old pose-only cache "
+                              "(control is extracted by default).")
+    parser.add_argument("--horizons-seconds", type=float, nargs="+", default=list(DEFAULT_HORIZONS_SECONDS),
+                         help="Look-ahead times (seconds) for the control vector "
+                              "(default: %(default)s)")
     args = parser.parse_args()
 
     build_and_split(
@@ -273,6 +365,8 @@ def main() -> None:
         val_fraction=args.val_fraction, frames_per_shard=args.frames_per_shard,
         seed=args.seed, strict_dim=args.strict_dim,
         kaggle_dataset_slug=args.kaggle_dataset_slug,
+        extract_control_vectors=args.extract_control_vectors,
+        horizons_seconds=args.horizons_seconds,
     )
 
 
