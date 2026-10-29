@@ -177,6 +177,12 @@ def main() -> None:
 
     if "state_dim" not in config:
         config["state_dim"] = train_ds.state_dim
+    if "control_dim" not in config:
+        # From the cache, same as state_dim -- a cache built with control
+        # (the default since preprocess_motion_mamba_cache.py started
+        # extracting it) makes this run control-conditioned automatically;
+        # a --no-control cache keeps it at 0, same as before.
+        config["control_dim"] = train_ds.control_dim
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
@@ -189,18 +195,21 @@ def main() -> None:
     val_loader = None
     if not args.no_val:
         val_ds = CachedSFTDataset(f"{args.cache_dir}/val.pt", n_frames=args.n_frames)
-        if val_ds.state_dim != config["state_dim"]:
+        if val_ds.state_dim != config["state_dim"] or val_ds.control_dim != config["control_dim"]:
             raise ValueError(
-                f"Cache state_dim={val_ds.state_dim} does not match the resumed "
-                f"checkpoint's state_dim={config['state_dim']} -- check the cache "
-                "was built from the same data that checkpoint was trained on."
+                f"Cache state_dim={val_ds.state_dim}/control_dim={val_ds.control_dim} does not "
+                f"match the resumed checkpoint's state_dim={config['state_dim']}/"
+                f"control_dim={config['control_dim']} -- check val.pt was built from the same "
+                "preprocessing run (control on/off, same horizons) as the train shard."
             )
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=True)
-        print(f"SFT dataset: state_dim={train_ds.state_dim}, n_frames={args.n_frames}, "
+        print(f"SFT dataset: state_dim={train_ds.state_dim}, control_dim={train_ds.control_dim}, "
+              f"n_frames={args.n_frames}, "
               f"train={len(train_ds)} samples across {train_ds.file_stats()['num_files']} files, "
               f"val={len(val_ds)} samples across {val_ds.file_stats()['num_files']} files")
     else:
-        print(f"SFT dataset: state_dim={train_ds.state_dim}, n_frames={args.n_frames}, "
+        print(f"SFT dataset: state_dim={train_ds.state_dim}, control_dim={train_ds.control_dim}, "
+              f"n_frames={args.n_frames}, "
               f"train={len(train_ds)} samples across {train_ds.file_stats()['num_files']} files, "
               f"val SKIPPED (--no-val)")
 

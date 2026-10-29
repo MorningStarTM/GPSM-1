@@ -123,6 +123,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
     config = dict(MODEL_CONFIG)
     config["state_dim"] = train_ds.state_dim
+    config["control_dim"] = train_ds.control_dim
 
     trainer = MotionMambaTrainer(config, ckpt_dir=args.ckpt_dir)
     trainer.device = torch.device(f"cuda:{rank}")

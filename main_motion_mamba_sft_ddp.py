@@ -167,6 +167,8 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
 
     if "state_dim" not in config:
         config["state_dim"] = train_ds.state_dim
+    if "control_dim" not in config:
+        config["control_dim"] = train_ds.control_dim
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size_per_gpu, shuffle=True, drop_last=True)
     train_counts = _gathered_batch_counts(train_loader, rank, world_size)
@@ -186,11 +188,12 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace) -> None:
         val_range = split_range(0, len(probe_val._files), world_size, rank)
         del probe_val
         val_ds = CachedSFTDataset(val_path, n_frames=args.n_frames, file_range=val_range)
-        if val_ds.state_dim != config["state_dim"]:
+        if val_ds.state_dim != config["state_dim"] or val_ds.control_dim != config["control_dim"]:
             raise ValueError(
-                f"Cache state_dim={val_ds.state_dim} does not match the resumed "
-                f"checkpoint's state_dim={config['state_dim']} -- check the cache "
-                "was built from the same data that checkpoint was trained on."
+                f"Cache state_dim={val_ds.state_dim}/control_dim={val_ds.control_dim} does not "
+                f"match the resumed checkpoint's state_dim={config['state_dim']}/"
+                f"control_dim={config['control_dim']} -- check val.pt was built from the same "
+                "preprocessing run (control on/off, same horizons) as the train shard."
             )
         val_loader = DataLoader(val_ds, batch_size=args.batch_size_per_gpu, shuffle=False, drop_last=True)
         val_counts = _gathered_batch_counts(val_loader, rank, world_size)

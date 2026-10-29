@@ -32,8 +32,10 @@ forward diverges sharply from real motion over a multi-step rollout, so
 this objective can no longer be satisfied by the trivial solution the way
 single-step MSE could.
 
-Expects a torch Dataset like CachedSFTDataset (or MultiSMPLXNPZSFTDataset),
-yielding (seed, target) = ((D,), (n_frames, D)) samples.
+Expects a torch Dataset like CachedSFTDataset, yielding (seed, target,
+control_future) = ((D,), (n_frames, state_dim), (n_frames, control_dim))
+samples -- control_future is width-0 for a control_dim=0 model, so the same
+code path handles both.
 """
 
 import os
@@ -89,7 +91,7 @@ class MotionMambaSFTTrainer:
     def _module(self):
         return self.model.module if self._is_ddp() else self.model
 
-    def _rollout(self, seed: torch.Tensor, n_steps: int) -> torch.Tensor:
+    def _rollout(self, seed: torch.Tensor, n_steps: int, control: torch.Tensor = None) -> torch.Tensor:
         """Same free-running autoregressive loop as
         MotionMamba.rollout_batch, reimplemented here calling
         `self.model(window)` at every step instead of
@@ -106,13 +108,27 @@ class MotionMambaSFTTrainer:
         context window (see motion_mamba.py's module docstring). The
         window grows for the whole rollout, same as
         MotionMamba.rollout_batch's own established pattern.
+
+        With control (``control`` given, ``(B, n_steps, control_dim)``):
+        the model only ever predicts pose, so each step's own real,
+        recorded control -- not anything predicted -- is concatenated onto
+        the newly generated pose before it's appended to the window, same
+        "``control[i]`` belongs to the newly generated frame ``i``"
+        convention as ``MotionMamba.rollout()``. This is what makes the
+        objective "free-run the pose, but tell it each step what it was
+        actually supposed to do next" rather than leaving the model to
+        guess the control too.
         """
         window = seed
         preds = []
-        for _ in range(n_steps):
+        for i in range(n_steps):
             logits = self.model(window)  # self.model(...), NOT self.model.rollout_batch(...)
-            next_frame = logits[:, -1:, :]
-            preds.append(next_frame)
+            next_pose = logits[:, -1:, :]
+            preds.append(next_pose)
+            if control is not None:
+                next_frame = torch.cat([next_pose, control[:, i : i + 1, :]], dim=-1)
+            else:
+                next_frame = next_pose
             window = torch.cat([window, next_frame], dim=1)
         return torch.cat(preds, dim=1)
 
@@ -216,15 +232,16 @@ class MotionMambaSFTTrainer:
                 if max_steps_per_epoch is not None and step >= max_steps_per_epoch:
                     break
 
-                seed, target = batch  # seed: (B, D), target: (B, n_frames, D)
+                seed, target, control_future = batch  # seed: (B, D), target: (B, n_frames, state_dim)
 
                 seed = seed.to(self.device).unsqueeze(1)  # (B, 1, D) -- _rollout() expects (B, T0, D)
                 target = target.to(self.device)
+                control = control_future.to(self.device) if self.config.get("control_dim", 0) > 0 else None
 
                 if not (torch.isfinite(seed).all() and torch.isfinite(target).all()):
                     continue  # skip NaN/Inf batches
 
-                pred_seq = self._rollout(seed, n_steps=target.shape[1])
+                pred_seq = self._rollout(seed, n_steps=target.shape[1], control=control)
                 loss = self._compute_loss(pred_seq, target) * self.config.get("loss_scale", 1.0)
 
                 self.optimizer.zero_grad(set_to_none=True)
@@ -248,10 +265,11 @@ class MotionMambaSFTTrainer:
                     for vstep, batch in enumerate(val_loader):
                         if max_steps_per_epoch is not None and vstep >= max_steps_per_epoch:
                             break
-                        seed, target = batch
+                        seed, target, control_future = batch
                         seed = seed.to(self.device).unsqueeze(1)
                         target = target.to(self.device)
-                        pred_seq = self._rollout(seed, n_steps=target.shape[1])
+                        control = control_future.to(self.device) if self.config.get("control_dim", 0) > 0 else None
+                        pred_seq = self._rollout(seed, n_steps=target.shape[1], control=control)
                         vtotal += float(self._compute_loss(pred_seq, target).item())
                         vn += 1
                 val_loss = reduce_mean(vtotal / max(vn, 1), self.device)
